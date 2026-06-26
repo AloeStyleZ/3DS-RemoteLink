@@ -122,6 +122,24 @@ static bool doHandshake(int outputIndex, bool wantJpeg, int fps, int quality,
     return true;
 }
 
+// Dibuja un marcador llamativo del cursor en el frame YUV (modo escritorio).
+// DXGI no captura el cursor, asi que lo componemos nosotros en GetCursorPos.
+// Cuadro magenta (Y106/U202/V222) con borde negro -> visible a baja resolucion.
+static void drawCursorMarker(YuvFrame& f, int cx, int cy) {
+    const int cs = f.w / 2;
+    for (int dy = -5; dy <= 5; ++dy) {
+        for (int dx = -5; dx <= 5; ++dx) {
+            int x = cx + dx, y = cy + dy;
+            if (x < 0 || y < 0 || x >= f.w || y >= f.h) continue;
+            const bool border = (dx < -3 || dx > 3 || dy < -3 || dy > 3);
+            f.y[(size_t)y * f.w + x] = border ? 16 : 106;
+            const size_t ci = (size_t)(y / 2) * cs + (x / 2);
+            f.u[ci] = border ? 128 : 202;
+            f.v[ci] = border ? 128 : 222;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     int  outputIndex = 0;
     bool wantJpeg = false;
@@ -186,6 +204,19 @@ int main(int argc, char** argv) {
             if (f.valid) {
                 bgraToI420Scaled(f.bgra, f.width, f.height, f.rowPitch, cur);
                 capture.endFrame();          // libera el mapeo cuanto antes
+                if (input.isDesktop()) {     // componer el cursor (modo escritorio)
+                    POINT pt;
+                    if (GetCursorPos(&pt)) {
+                        int dw = capture.desktopWidth(), dh = capture.desktopHeight();
+                        if (dw > 0 && dh > 0) {
+                            int sx = (int)((long long)pt.x * cfg.width  / dw);
+                            int sy = (int)((long long)pt.y * cfg.height / dh);
+                            if (sx < 0) sx = 0; else if (sx >= cfg.width)  sx = cfg.width  - 1;
+                            if (sy < 0) sy = 0; else if (sy >= cfg.height) sy = cfg.height - 1;
+                            drawCursorMarker(cur, sx, sy);
+                        }
+                    }
+                }
                 sender.sendFrame(cur);
                 ++frames;
             }

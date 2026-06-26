@@ -14,6 +14,10 @@ public:
     bool start(uint16_t port);
     void stop();
 
+    // true si el cliente esta en modo escritorio (raton). Lo lee el loop de video
+    // para componer el marcador del cursor.
+    bool isDesktop() const { return desktop_.load(); }
+
 private:
     void runLoop();
     void applyInput(const InputPacket& p);
@@ -21,8 +25,10 @@ private:
     SOCKET            sock_ = INVALID_SOCKET;
     std::thread       thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> desktop_{false};
     uint16_t          lastSeq_ = 0;
     bool              haveSeq_ = false;
+    bool              prevLClick_ = false;
 
 #ifdef HAVE_VIGEM
     void* client_ = nullptr;  // PVIGEM_CLIENT

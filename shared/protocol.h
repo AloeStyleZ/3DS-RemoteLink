@@ -139,15 +139,22 @@ typedef struct {
     u32 buttons;      /* hidKeysHeld() bitfield               off 4 (alineado) */
     s16 circle_x;     /* eje X circle pad                     off 8            */
     s16 circle_y;     /* eje Y circle pad                     off 10           */
-    s16 right_x;      /* stick derecho (-32767..32767)        off 12           */
-    s16 right_y;      /* (calculado en el cliente)            off 14           */
+    s16 right_x;      /* juego: stick derecho; escritorio: delta raton X off 12 */
+    s16 right_y;      /* juego: stick derecho; escritorio: delta raton Y off 14 */
     u8  vbuttons;     /* botones tactiles virtuales (VBTN_*)  off 16           */
-    u8  _pad;         /* alineacion                           off 17           */
+    u8  mode;         /* INPUT_MODE_* (juego / escritorio)    off 17           */
 } InputPacket;        /* sizeof == 18 */
+
+/* Modo de input (campo mode). Decide como interpreta el servidor el tactil. */
+enum {
+    INPUT_MODE_GAME    = 0,  /* tactil = stick derecho + R3        */
+    INPUT_MODE_DESKTOP = 1   /* tactil = trackpad de raton          */
+};
 
 /* Botones tactiles virtuales (campo vbuttons). */
 enum {
-    VBTN_R3 = 1u << 0   /* clic del stick derecho (touch en el boton izquierdo) */
+    VBTN_R3     = 1u << 0,   /* (juego)      clic del stick derecho             */
+    VBTN_LCLICK = 1u << 1    /* (escritorio) clic izquierdo del raton           */
 };
 
 /* Subset de mascaras de hidKeysHeld() relevantes (espejo de libctru/hid.h).
