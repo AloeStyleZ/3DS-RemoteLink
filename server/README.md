@@ -1,8 +1,8 @@
-# Servidor PC — 3DSStreaming
+# PC server — 3DSStreaming
 
-Captura el escritorio con DXGI, lo convierte a YUV420, envía solo los tiles que
-cambiaron por UDP al 3DS y recibe el input del 3DS para inyectarlo como gamepad
-Xbox 360 virtual.
+Captures the desktop with DXGI, converts it to YUV420, sends only the tiles that
+changed over UDP to the 3DS, and receives the 3DS input to inject it as a virtual
+Xbox 360 gamepad.
 
 ## Pipeline
 
@@ -10,19 +10,19 @@ Xbox 360 virtual.
 DXGI Desktop Duplication (GPU, BGRA)
         │  CopyResource → staging → Map (CPU)
         ▼
-bgraToI420Scaled()  BGRA → I420 + escalado a 400×240   [convert.cpp]
+bgraToI420Scaled()  BGRA → I420 + scale to 400×240    [convert.cpp]
         ▼
-computeDirtyTiles() diff por tile vs frame anterior     [convert.cpp]
+computeDirtyTiles() per-tile diff vs previous frame    [convert.cpp]
         ▼
-VideoSender::sendFrame()  encode (RAW/JPEG) + fragmentación UDP → :8000  [video.cpp]
+VideoSender::sendFrame()  encode (RAW/JPEG) + UDP fragmentation → :8000  [video.cpp]
 
-InputServer (hilo aparte): UDP :8001 → filtro seq → ViGEm Xbox360   [input.cpp]
-Handshake TCP :7999 negocia resolución/codec/puertos               [main.cpp]
+InputServer (separate thread): UDP :8001 → seq filter → ViGEm Xbox360   [input.cpp]
+TCP handshake :7999 negotiates resolution/codec/ports                  [main.cpp]
 ```
 
-## Compilar
+## Build
 
-Núcleo (solo Windows SDK, sin dependencias externas):
+Core (Windows SDK only, no external dependencies):
 
 ```sh
 cmake -S . -B build
@@ -30,41 +30,51 @@ cmake --build build --config Release
 # -> build/Release/server.exe
 ```
 
-Con gamepad virtual (requiere driver ViGEmBus + vcpkg):
+With JPEG codec + virtual gamepad (requires vcpkg + the ViGEmBus driver):
 
 ```sh
-vcpkg install vigemclient libjpeg-turbo
-cmake -S . -B build -DUSE_VIGEM=ON -DUSE_TURBOJPEG=ON ^
+vcpkg install libjpeg-turbo:x64-windows
+cmake -S . -B build -DUSE_TURBOJPEG=ON -DUSE_VIGEM=ON ^
       -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
 
-## Ejecutar
+ViGEmClient is vendored under `third_party/ViGEmClient` (MIT); the runtime still
+needs the [ViGEmBus](https://github.com/ViGEm/ViGEmBus/releases) driver installed.
+
+## Run
 
 ```sh
-server.exe                 # codec RAW YUV420 (baseline, CPU ~0 en el 3DS)
-server.exe --jpeg          # codec MJPEG (requiere USE_TURBOJPEG)
-server.exe --output 1      # capturar el segundo monitor
+server.exe                          # RAW YUV420 (baseline, ~0 CPU on the 3DS)
+server.exe --jpeg                   # MJPEG codec (needs USE_TURBOJPEG)
+server.exe --jpeg --fps 24 --quality 40   # tune frame rate / quality
+server.exe --output 1               # capture the second monitor
 ```
 
-Queda esperando en TCP 7999 a que el cliente 3DS conecte. Ctrl+C para salir.
+Flags:
+- `--jpeg` — use the MJPEG codec (much lower bandwidth; needed for motion).
+- `--fps N` — target frame rate (5–60).
+- `--quality N` — JPEG quality (10–95). Lower = smaller tiles + faster client decode.
+- `--output N` — monitor index to capture.
 
-## Estado
+It waits on TCP 7999 for the 3DS client to connect. Ctrl+C to exit.
 
-| Componente | Estado |
+## Status
+
+| Component | State |
 |---|---|
-| Handshake TCP | ✅ |
-| Captura DXGI + reinit ante ACCESS_LOST | ✅ |
-| BGRA→I420 + escalado | ✅ (point-sampling; sustituible por libyuv) |
-| Delta por tiles + keyframes | ✅ |
-| Fragmentación UDP (protocol.h) | ✅ |
-| Recepción de input + filtro de secuencia | ✅ |
-| Inyección ViGEm | ✅ tras `-DUSE_VIGEM=ON` (si no, traza por consola) |
-| Codec MJPEG | ✅ tras `-DUSE_TURBOJPEG=ON` |
+| TCP handshake | ✅ |
+| DXGI capture + reinit on ACCESS_LOST | ✅ |
+| BGRA→I420 + scaling | ✅ (point sampling; swappable for libyuv) |
+| Tile delta + keyframes | ✅ |
+| UDP fragmentation (protocol.h) | ✅ |
+| Input receive + sequence filter | ✅ |
+| ViGEm injection | ✅ with `-DUSE_VIGEM=ON` (otherwise logs to console) |
+| MJPEG codec | ✅ with `-DUSE_TURBOJPEG=ON` |
+| Touch → right stick + R3 | ✅ |
 
-## Pendiente / mejoras
+## Notes / TODO
 
-- Sin ViGEm, el input solo se traza por consola (útil para validar el canal).
-- El touchscreen se recibe pero aún no se mapea a ViGEm (¿stick derecho / ratón?).
-- Escalado por point-sampling: para calidad/velocidad, migrar a libyuv.
-- Manejo de `CtrlPacket` (CTRL_REQUEST_KEYFRAME) entrante aún no implementado.
+- Without ViGEm, input is only logged to the console (useful to validate the channel).
+- Point-sampling scaler: migrate to libyuv for quality/speed if needed.
+- Incoming `CtrlPacket` (CTRL_REQUEST_KEYFRAME) not yet handled.

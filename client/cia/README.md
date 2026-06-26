@@ -1,59 +1,54 @@
-# Empaquetado .cia
+# .cia packaging
 
-Genera `client.cia` para instalar en el menú HOME de una 3DS con CFW (Luma3DS).
-Para **desarrollo** sigue prefiriendo `.3dsx` + `3dslink` (ver el README del cliente);
-el `.cia` es para tenerlo instalado "de verdad".
+Builds `client.cia` to install on the HOME menu of a 3DS with CFW (Luma3DS).
+For **development** keep using `.3dsx` + `3dslink` (see the client README); the
+`.cia` is for a permanent install.
 
-## 1) Herramientas (una vez)
+## 1) Tools (once)
 
-No vienen con devkitPro; bájalas de los releases de GitHub de Steveice10 y ponlas
-en el PATH (p.ej. en `$DEVKITPRO/tools/bin`):
+Not shipped with devkitPro; grab them from Steveice10's GitHub releases and put
+them on the PATH (e.g. in `$DEVKITPRO/tools/bin`):
 
-- **makerom**   → repo `Project_CTR`
-- **bannertool** → repo `bannertool`
+- **makerom**   → `Project_CTR` repo
+- **bannertool** → `bannertool` repo
 
-Comprueba: `makerom -h` y `bannertool` deben responder.
+Verify: `makerom -h` and `bannertool` should respond.
 
-## 2) Assets (los pones tú en esta carpeta `client/cia/`)
+## 2) Assets (you provide these in this `client/cia/` folder)
 
-| Archivo | Formato | Para qué |
+| File | Format | Purpose |
 |---|---|---|
-| `icon.png`   | PNG **48×48**  | icono del menú HOME |
-| `banner.png` | PNG **256×128** | banner (la imagen ancha al seleccionar) |
-| `banner.wav` | WAV **PCM 16-bit** (corto) | sonido del banner; vale uno en silencio |
+| `icon.png`   | PNG **48×48**  | HOME menu icon |
+| `banner.png` | PNG **256×128** | banner (the wide image when selected) |
+| `banner.wav` | WAV **PCM 16-bit** (short) | banner sound; a silent one is fine |
 
-¿No tienes arte aún? Sirven placeholders. Con ImageMagick + ffmpeg:
+No artwork yet? Placeholders work. With ImageMagick + ffmpeg:
 
 ```sh
-magick -size 48x48  xc:#1e6fd0 icon.png
+magick -size 48x48   xc:#1e6fd0 icon.png
 magick -size 256x128 xc:#1e6fd0 banner.png
 ffmpeg -f lavfi -i anullsrc=r=22050:cl=mono -t 1 -c:a pcm_s16le banner.wav
 ```
 
-## 3) Construir
+## 3) Build
 
 ```sh
 cd client
-make                      # produce client.elf (y client.3dsx)
-./cia/build_cia.sh        # produce client.cia
+make                      # produces client.elf (and client.3dsx)
+./cia/build_cia.sh        # produces client.cia
 ```
 
-## 4) Instalar en la 3DS
+## 4) Install on the 3DS
 
-1. Copia `client.cia` a la SD.
-2. Abre **FBI** → SD → selecciona `client.cia` → *Install and delete*.
-3. Aparece "3DSStream" en el menú HOME. Lánzalo como cualquier juego.
+1. Copy `client.cia` to the SD card.
+2. Open **FBI** → SD → select `client.cia` → *Install and delete*.
+3. "3DSStream" appears on the HOME menu. Launch it like any game.
 
-(Luma3DS aplica los parches de firma por defecto, así que FBI instala el CIA sin más.)
+(Luma3DS applies signature patches by default, so FBI installs the CIA without issues.)
 
-## Por qué este RSF
+## Why this RSF
 
-[app.rsf](app.rsf) parte de la plantilla estándar de homebrew. Lo específico de
-esta app es `ServiceAccessControl`, que **debe** incluir `soc:U` (sockets),
-`ndm:u` y `ac:u` (WiFi) y `y2r:u` (conversión YUV→RGB). Si el CIA arranca pero
-falla la red o el vídeo, ese bloque es lo primero a revisar.
-
-
-cd /d/Proyectos/3DSStreaming/client
-
-agregemos por ultimo que al presionar select + start salga un menu con 2 opciones, Configura y Salir, con configuracion agregaremos opciones y con salir saldra de la aplicacion 
+[app.rsf](app.rsf) is based on the standard homebrew template. The app-specific
+part is `ServiceAccessControl`, which **must** include `soc:U` (sockets),
+`ndm:u` and `ac:u` (WiFi) and `y2r:u` (YUV→RGB conversion). If the CIA boots but
+networking or video fails, that block is the first thing to check.

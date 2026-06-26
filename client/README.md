@@ -1,66 +1,73 @@
-# Cliente 3DS — 3DSStreaming
+# 3DS client — 3DSStreaming
 
-Cliente para Old/New Nintendo 3DS. Recibe vídeo YUV420 por UDP, lo reensambla,
-lo convierte a RGB con el módulo hardware **Y2R** y lo dibuja con **citro2d**.
-Captura el input con libctru y lo envía al PC por UDP.
+Client for the Old/New Nintendo 3DS. Receives YUV420 video over UDP, reassembles
+it, converts it to RGB with the **Y2R hardware module** and draws it with
+**citro2d**. Captures input with libctru and sends it to the PC over UDP, including
+a virtual right stick + R3 button on the touch screen.
 
 ## Pipeline
 
 ```
-Handshake TCP :7999  ──► negocia resolución/codec/puertos        [net.c]
+TCP handshake :7999  ──► negotiate resolution/codec/ports        [net.c]
         │
-  bucle cada frame (~60 Hz):
+  loop every frame (~60 Hz):
    1. hidScanInput → InputPacket → UDP :8001                     [main.c/net.c]
-   2. net_drain_video: recvfrom no bloqueante (UDP :8000)        [net.c]
-        └─ video_on_packet: reensambla tile → unpack en I420     [decoder.c]
-           └─ al recibir FRAME_END: Y2R (YUV→RGB565) → textura   [decoder.c]
-   3. C2D_DrawImageAt: dibuja la textura en el top screen        [decoder.c]
+   2. net_drain_video: non-blocking recvfrom (UDP :8000)         [net.c]
+        └─ video_on_packet: reassemble tile → JPEG/RAW decode    [decoder.c]
+   3. video_update: Y2R (YUV→RGB) → texture (latest frame)       [decoder.c]
+   4. citro2d: draw video (top) + virtual stick/R3 (bottom)      [main.c]
 ```
 
-## Requisitos
+## Requirements
 
-devkitPro con los paquetes 3DS:
+devkitPro with the 3DS packages:
 
 ```sh
-# instalar devkitPro (pacman): 3ds-dev incluye libctru, citro3d, citro2d
-dkp-pacman -S 3ds-dev
+dkp-pacman -S 3ds-dev 3ds-libjpeg-turbo
 ```
 
-Asegúrate de tener `DEVKITPRO` y `DEVKITARM` en el entorno.
+Make sure `DEVKITPRO` and `DEVKITARM` are set in the environment.
 
-## Compilar
+## Build
 
 ```sh
 cd client
 make          # -> client.3dsx
 ```
 
-(Compila contra `../shared/protocol.h`, compartido con el servidor.)
+(Builds against `../shared/protocol.h`, shared with the server.)
 
-## Configurar y ejecutar
+## Configure and run
 
-1. Edita [source/config.h](source/config.h): pon `SERVER_IP` = IP de tu PC en la LAN.
-2. Arranca el servidor en el PC (queda esperando en TCP 7999).
-3. Copia `client.3dsx` a la SD (`/3ds/`) y lánzalo desde el Homebrew Launcher,
-   o ejecútalo en **Citra/Lime3DS** (emulador) para iterar rápido.
-4. Salir: **START + SELECT**.
+1. Edit [source/config.h](source/config.h):
+   - `SERVER_IP` = your PC's IP on the LAN.
+   - `STREAM_WIDTH` / `STREAM_HEIGHT` = stream resolution (multiple of 80: 400×240, 320×240, 320×160, 240×160).
+2. Start the server on the PC (it waits on TCP 7999).
+3. Copy `client.3dsx` to the SD card (`/3ds/`) and launch it from the Homebrew Launcher
+   (or push it over WiFi with `3dslink -a <3DS_IP> client.3dsx`).
+4. Exit: **START + SELECT**.
 
-## Estado y puntos a verificar en hardware
+> Test on real hardware: Citra/Lime3DS does not implement LAN sockets to the host,
+> so the network path won't connect there.
 
-Escrito sin poder compilar/probar aquí (sin toolchain). Lo más probable que haya
-que ajustar al primer arranque:
+## Controls
 
-| Punto | Dónde | Qué mirar |
-|---|---|---|
-| Layout Y2R→textura | `video_present()` en decoder.c | Si la imagen sale descuadrada/rayada, revisar `unit`/`gap` de `Y2RU_SetReceiving` |
-| Orientación de la imagen | `subtex.top/bottom` en decoder.c | Si sale invertida, intercambiar `top`/`bottom` |
-| Color | `Y2RU_SetStandardCoefficient` | `_SCALING` (rango estudio) vs sin scaling |
-| Socket no bloqueante | `net_open_streams()` | depende de `fcntl(O_NONBLOCK)` en el lwip del 3DS |
+| 3DS | Xbox 360 |
+|---|---|
+| A B X Y | A B X Y (by name) |
+| L / R | LB / RB |
+| D-pad | D-pad |
+| Circle pad | Left stick |
+| START / SELECT | Start / Back |
+| Touch screen (right circle) | Right stick (sticky: clamps to the edge) |
+| Touch screen (left button) | R3 (right-stick click) |
 
-## Pendiente / mejoras
+The touch screen is single-touch, so the right stick and R3 cannot be used at the
+same time. Stick/R3 geometry lives in `shared/protocol.h` (`VSTICK_*`, `VR3_*`).
 
-- **Hilo receptor en core1** (`APT_SetAppCpuTimeLimit` + `threadCreate`): hoy el
-  `recv` se drena en el hilo principal. Es la optimización clave del plan original.
-- Decoder JPEG (codec 1): hoy solo RAW YUV420.
-- Pedir keyframe (`CTRL_REQUEST_KEYFRAME`) al detectar tiles congelados.
-- IP del servidor por teclado en pantalla (`swkbdInit`) en vez de `config.h`.
+## Notes / TODO
+
+- Receive on a core1 thread (less urgent; runs fine single-threaded for now).
+- Map ZL/ZR to extra touch zones.
+- Position-based face-button mapping if name-based feels swapped.
+- Enter the server IP via on-screen keyboard (swkbd) instead of `config.h`.
