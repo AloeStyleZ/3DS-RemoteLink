@@ -1,0 +1,22 @@
+# --- Build outputs: servidor PC (CMake) ---
+build/
+build-jpeg/
+
+# --- Build outputs: cliente 3DS (devkitARM) ---
+*.3dsx
+*.elf
+*.smdh
+*.cia
+*.bnr
+*.map
+*.o
+*.d
+*.lst
+*.lz
+
+# --- Misc ---
+*.tmp
+*.log
+Thumbs.db
+.DS_Store
+.vs/
