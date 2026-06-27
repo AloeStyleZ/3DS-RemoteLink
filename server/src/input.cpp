@@ -79,8 +79,9 @@ static inline short scaleAxis(int v) {
 
 void InputServer::applyInput(const InputPacket& p) {
     const uint32_t b = p.buttons;
-    const bool desktop = (p.mode == INPUT_MODE_DESKTOP);
+    const bool desktop = (p.mode & INPUT_MODE_DESKTOP) != 0;
     desktop_.store(desktop);
+    audio_.store((p.mode & INPUT_FLAG_AUDIO) != 0);
 
     // --- Modo escritorio: raton via SendInput (funciona aunque no haya ViGEm) ---
     if (desktop) {

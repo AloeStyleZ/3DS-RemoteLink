@@ -1,6 +1,7 @@
 #include "net.h"
 #include "decoder.h"
 #include "config.h"
+#include "audio.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -17,6 +18,7 @@
 static u32* s_socBuf   = NULL;
 static int  s_videoSock = -1;
 static int  s_inputSock = -1;
+static int  s_audioSock = -1;
 static struct sockaddr_in s_inputAddr;
 
 bool net_init(void) {
@@ -32,6 +34,7 @@ bool net_init(void) {
 void net_exit(void) {
     if (s_videoSock >= 0) { close(s_videoSock); s_videoSock = -1; }
     if (s_inputSock >= 0) { close(s_inputSock); s_inputSock = -1; }
+    if (s_audioSock >= 0) { close(s_audioSock); s_audioSock = -1; }
     socExit();
     if (s_socBuf) { free(s_socBuf); s_socBuf = NULL; }
 }
@@ -107,6 +110,24 @@ bool net_open_streams(const char* server_ip, const ServerHello* sh) {
     s_inputAddr.sin_addr.s_addr = inet_addr(server_ip);
     s_inputAddr.sin_port = htons(sh->udp_input_port ? sh->udp_input_port : PORT_INPUT);
 
+    // --- audio: UDP de recepcion (PC -> 3DS), no bloqueante ---
+    s_audioSock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s_audioSock >= 0) {
+        struct sockaddr_in aaddr;
+        memset(&aaddr, 0, sizeof(aaddr));
+        aaddr.sin_family = AF_INET;
+        aaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        aaddr.sin_port = htons(PORT_AUDIO);
+        if (bind(s_audioSock, (struct sockaddr*)&aaddr, sizeof(aaddr)) == 0) {
+            int rcv = 128 * 1024;
+            setsockopt(s_audioSock, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
+            int fl = fcntl(s_audioSock, F_GETFL, 0);
+            fcntl(s_audioSock, F_SETFL, fl | O_NONBLOCK);
+        } else {
+            close(s_audioSock); s_audioSock = -1;
+        }
+    }
+
     return true;
 }
 
@@ -130,4 +151,20 @@ bool net_drain_video(struct VideoDecoder* dec) {
         if (video_on_packet(dec, buf, n)) frameDone = true;
     }
     return frameDone;
+}
+
+void net_drain_audio(void) {
+    if (s_audioSock < 0) return;
+    static u8 buf[2048];
+    for (int i = 0; i < 64; ++i) {     // cota por iteracion
+        int n = recvfrom(s_audioSock, buf, sizeof(buf), 0, NULL, NULL);
+        if (n <= 0) break;
+        if (n < (int)sizeof(AudioPacketHeader)) continue;
+        AudioPacketHeader h;
+        memcpy(&h, buf, sizeof(h));
+        if (h.magic != PROTO_MAGIC || h.type != PKT_AUDIO) continue;
+        int avail = (n - (int)sizeof(AudioPacketHeader)) / 2;
+        int samples = h.samples < avail ? h.samples : avail;
+        audio_feed((const s16*)(buf + sizeof(AudioPacketHeader)), samples, h.rate);
+    }
 }

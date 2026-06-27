@@ -22,3 +22,6 @@ void net_send_input(const InputPacket* p);
 // Drena TODOS los datagramas de video disponibles (socket no bloqueante),
 // pasandolos al decoder. Devuelve true si algun frame se completo (FRAME_END).
 bool net_drain_video(struct VideoDecoder* dec);
+
+// Drena los datagramas de audio disponibles y los reproduce (NDSP).
+void net_drain_audio(void);

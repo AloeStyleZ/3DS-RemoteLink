@@ -212,11 +212,13 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
     return false;
 }
 
-void video_update(VideoDecoder* d) {
+bool video_update(VideoDecoder* d) {
     if (d->pendingPresent) {
         video_present(d);
         d->pendingPresent = false;
+        return true;
     }
+    return false;
 }
 
 void video_draw(VideoDecoder* d, float x, float y) {

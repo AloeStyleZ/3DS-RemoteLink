@@ -12,6 +12,7 @@
 #include "convert.h"
 #include "video.h"
 #include "input.h"
+#include "audio.h"
 
 #include <cstdio>
 #include <cstring>
@@ -122,20 +123,50 @@ static bool doHandshake(int outputIndex, bool wantJpeg, int fps, int quality,
     return true;
 }
 
-// Dibuja un marcador llamativo del cursor en el frame YUV (modo escritorio).
-// DXGI no captura el cursor, asi que lo componemos nosotros en GetCursorPos.
-// Cuadro magenta (Y106/U202/V222) con borde negro -> visible a baja resolucion.
+// Forma del puntero (1 = relleno). Punta (vertice principal) arriba-izquierda en (0,0).
+// Cabeza triangular inclinada + cola hacia abajo-derecha, como un cursor clasico.
+static const char* CURSOR_MASK[] = {
+    "1..........",
+    "11.........",
+    "111........",
+    "1111.......",
+    "11111......",
+    "111111.....",
+    "1111111....",
+    "11111111...",
+    "111111111..",
+    "1111111111.",
+    ".....1111..",
+    "......1111.",
+    ".......1111",
+    "........111",
+    ".........11",
+};
+
+// Dibuja el cursor (flecha blanca con borde negro) en el frame YUV. DXGI no
+// captura el cursor, asi que lo componemos donde esta el raton (GetCursorPos).
+// El borde se genera solo: un pixel relleno es borde si algun vecino no lo esta.
 static void drawCursorMarker(YuvFrame& f, int cx, int cy) {
     const int cs = f.w / 2;
-    for (int dy = -5; dy <= 5; ++dy) {
-        for (int dx = -5; dx <= 5; ++dx) {
-            int x = cx + dx, y = cy + dy;
+    const int H  = (int)(sizeof(CURSOR_MASK) / sizeof(CURSOR_MASK[0]));
+    for (int ry = 0; ry < H; ++ry) {
+        const char* row = CURSOR_MASK[ry];
+        const int W = (int)strlen(row);
+        for (int rx = 0; rx < W; ++rx) {
+            if (row[rx] != '1') continue;
+            bool edge = false;
+            if (rx == 0     || row[rx - 1] != '1') edge = true;
+            if (rx == W - 1 || row[rx + 1] != '1') edge = true;
+            if (ry == 0) edge = true;
+            else { const char* up = CURSOR_MASK[ry - 1]; if (rx >= (int)strlen(up) || up[rx] != '1') edge = true; }
+            if (ry == H - 1) edge = true;
+            else { const char* dn = CURSOR_MASK[ry + 1]; if (rx >= (int)strlen(dn) || dn[rx] != '1') edge = true; }
+
+            const int x = cx + rx, y = cy + ry;
             if (x < 0 || y < 0 || x >= f.w || y >= f.h) continue;
-            const bool border = (dx < -3 || dx > 3 || dy < -3 || dy > 3);
-            f.y[(size_t)y * f.w + x] = border ? 16 : 106;
+            f.y[(size_t)y * f.w + x] = edge ? 16 : 235;   // borde negro / relleno blanco
             const size_t ci = (size_t)(y / 2) * cs + (x / 2);
-            f.u[ci] = border ? 128 : 202;
-            f.v[ci] = border ? 128 : 222;
+            f.u[ci] = 128; f.v[ci] = 128;                  // gris neutro (blanco/negro)
         }
     }
 }
@@ -180,6 +211,12 @@ int main(int argc, char** argv) {
     InputServer input;
     input.start(PORT_INPUT);
 
+    // Audio (WASAPI loopback). Solo envia cuando el cliente lo pide.
+    sockaddr_in audioDst = clientAddr;
+    audioDst.sin_port = htons(PORT_AUDIO);
+    AudioSender audio;
+    audio.start(audioDst);
+
     DesktopCapture capture;
     if (!capture.init(outputIndex)) {
         fprintf(stderr, "[main] captura DXGI fallo\n");
@@ -198,6 +235,7 @@ int main(int argc, char** argv) {
 
     while (g_running) {
         auto t0 = std::chrono::steady_clock::now();
+        audio.setEnabled(input.audioEnabled());
 
         CapturedFrame f;
         if (capture.capture(f, (uint32_t)frameDur.count())) {
@@ -239,6 +277,7 @@ int main(int argc, char** argv) {
     }
 
     fprintf(stderr, "\n[main] cerrando...\n");
+    audio.stop();
     input.stop();
     closesocket(videoSock);
     WSACleanup();
