@@ -48,7 +48,8 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len);
 
 // Si hay un frame completo pendiente, lo convierte con Y2R y actualiza la
 // textura. Llamar UNA vez por iteracion del bucle, tras drenar el socket.
-void video_update(VideoDecoder* d);
+// Devuelve true si presento un frame nuevo (util para contar FPS).
+bool video_update(VideoDecoder* d);
 
 // Dibuja la textura actual (llamar dentro de C2D_SceneBegin).
 void video_draw(VideoDecoder* d, float x, float y);

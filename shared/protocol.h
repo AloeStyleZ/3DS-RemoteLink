@@ -35,6 +35,7 @@ typedef int16_t  s16;
 #define PORT_HANDSHAKE       7999    /* TCP : negociacion inicial               */
 #define PORT_VIDEO           8000    /* UDP : PC  -> 3DS (video)                */
 #define PORT_INPUT           8001    /* UDP : 3DS -> PC  (input, max prioridad) */
+#define PORT_AUDIO           8002    /* UDP : PC  -> 3DS (audio, opcional)      */
 
 /* Payload util por datagrama (sin contar cabeceras IP/UDP).
  * 1400 (MTU seguro) - 16 (cabecera de video) = 1384, redondeo a 1380.        */
@@ -66,7 +67,8 @@ typedef int16_t  s16;
 enum {
     PKT_VIDEO  = 0x10,   /* fragmento de video  (PC -> 3DS)  */
     PKT_INPUT  = 0x20,   /* estado de input     (3DS -> PC)  */
-    PKT_CTRL   = 0x30    /* control fuera-de-banda por UDP (p.ej. pedir keyframe) */
+    PKT_CTRL   = 0x30,   /* control fuera-de-banda por UDP (p.ej. pedir keyframe) */
+    PKT_AUDIO  = 0x40    /* muestras de audio   (PC -> 3DS)  */
 };
 
 /* --- Codecs del payload de video (campo `codec`) -------------------------- */
@@ -139,15 +141,25 @@ typedef struct {
     u32 buttons;      /* hidKeysHeld() bitfield               off 4 (alineado) */
     s16 circle_x;     /* eje X circle pad                     off 8            */
     s16 circle_y;     /* eje Y circle pad                     off 10           */
-    s16 right_x;      /* stick derecho (-32767..32767)        off 12           */
-    s16 right_y;      /* (calculado en el cliente)            off 14           */
+    s16 right_x;      /* juego: stick derecho; escritorio: delta raton X off 12 */
+    s16 right_y;      /* juego: stick derecho; escritorio: delta raton Y off 14 */
     u8  vbuttons;     /* botones tactiles virtuales (VBTN_*)  off 16           */
-    u8  _pad;         /* alineacion                           off 17           */
+    u8  mode;         /* INPUT_MODE_* (juego / escritorio)    off 17           */
 } InputPacket;        /* sizeof == 18 */
+
+/* Campo `mode`: ahora es un bitfield de flags.
+ *   bit0 = tactil como trackpad de raton (si no, stick derecho + R3)
+ *   bit1 = audio habilitado (el cliente pide que el servidor envie audio)        */
+enum {
+    INPUT_MODE_GAME    = 0,        /* (valor) tactil = stick derecho + R3 */
+    INPUT_MODE_DESKTOP = 1u << 0,  /* (bit0)  tactil = trackpad de raton   */
+    INPUT_FLAG_AUDIO   = 1u << 1   /* (bit1)  audio habilitado             */
+};
 
 /* Botones tactiles virtuales (campo vbuttons). */
 enum {
-    VBTN_R3 = 1u << 0   /* clic del stick derecho (touch en el boton izquierdo) */
+    VBTN_R3     = 1u << 0,   /* (juego)      clic del stick derecho             */
+    VBTN_LCLICK = 1u << 1    /* (escritorio) clic izquierdo del raton           */
 };
 
 /* Subset de mascaras de hidKeysHeld() relevantes (espejo de libctru/hid.h).
@@ -187,6 +199,24 @@ typedef struct {
     u8  _pad;
     u32 arg;          /* p.ej. frame_id de referencia / timestamp ping        */
 } CtrlPacket;         /* sizeof == 8 */
+
+/* =============================================================================
+ *  CANAL DE AUDIO  (PC -> 3DS, UDP, puerto 8002) — PCM16 mono, opcional
+ * -----------------------------------------------------------------------------
+ *  El servidor captura el audio del sistema (WASAPI loopback), lo baja a PCM16
+ *  mono y lo trocea en datagramas. Solo lo envia si el cliente lo pide
+ *  (INPUT_FLAG_AUDIO en el campo mode del input). El cliente lo reproduce con NDSP.
+ * ============================================================================= */
+#define AUDIO_MAX_SAMPLES 480     /* muestras PCM16 mono por datagrama (~10ms@48k) */
+
+typedef struct {
+    u8  magic;        /* PROTO_MAGIC                                           */
+    u8  type;         /* PKT_AUDIO                                             */
+    u16 seq;          /* secuencia                                             */
+    u16 samples;      /* nº de muestras PCM16 mono en el payload               */
+    u16 rate;         /* frecuencia de muestreo (Hz), p.ej. 48000              */
+    /* sigue: s16 pcm[samples]                                                 */
+} AudioPacketHeader;  /* sizeof == 8 */
 
 /* =============================================================================
  *  HANDSHAKE   (TCP, puerto 7999)

@@ -14,14 +14,15 @@ add_executable(server
     src/capture.cpp
     src/convert.cpp
     src/video.cpp
-    src/input.cpp)
+    src/input.cpp
+    src/audio.cpp)
 
 target_include_directories(server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
 
 # Windows SDK: Direct3D 11, DXGI, Winsock.
-target_link_libraries(server PRIVATE d3d11 dxgi ws2_32)
+target_link_libraries(server PRIVATE d3d11 dxgi ws2_32 user32 ole32)
 
 if (MSVC)
     target_compile_options(server PRIVATE /O2 /W3)

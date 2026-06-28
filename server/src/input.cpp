@@ -1,6 +1,7 @@
 #include "input.h"
 #include "protocol.h"
 #include <ws2tcpip.h>
+#include <windows.h>   // SendInput (raton en modo escritorio)
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -77,12 +78,38 @@ static inline short scaleAxis(int v) {
 }
 
 void InputServer::applyInput(const InputPacket& p) {
+    const uint32_t b = p.buttons;
+    const bool desktop = (p.mode & INPUT_MODE_DESKTOP) != 0;
+    desktop_.store(desktop);
+    audio_.store((p.mode & INPUT_FLAG_AUDIO) != 0);
+
+    // --- Modo escritorio: raton via SendInput (funciona aunque no haya ViGEm) ---
+    if (desktop) {
+        if (p.right_x != 0 || p.right_y != 0) {
+            INPUT mi; memset(&mi, 0, sizeof(mi));
+            mi.type = INPUT_MOUSE;
+            mi.mi.dx = p.right_x;
+            mi.mi.dy = p.right_y;
+            mi.mi.dwFlags = MOUSEEVENTF_MOVE;   // movimiento relativo (trackpad)
+            SendInput(1, &mi, sizeof(INPUT));
+        }
+        const bool lclick = (p.vbuttons & VBTN_LCLICK) != 0;
+        if (lclick && !prevLClick_) {            // flanco -> clic completo (down+up)
+            INPUT cl[2]; memset(cl, 0, sizeof(cl));
+            cl[0].type = INPUT_MOUSE; cl[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+            cl[1].type = INPUT_MOUSE; cl[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+            SendInput(2, cl, sizeof(INPUT));
+        }
+        prevLClick_ = lclick;
+    } else {
+        prevLClick_ = false;
+    }
+
 #ifdef HAVE_VIGEM
     if (!pad_) return;
     XUSB_REPORT r;
     XUSB_REPORT_INIT(&r);
 
-    const uint32_t b = p.buttons;
     if (b & BTN_A)      r.wButtons |= XUSB_GAMEPAD_A;
     if (b & BTN_B)      r.wButtons |= XUSB_GAMEPAD_B;
     if (b & BTN_X)      r.wButtons |= XUSB_GAMEPAD_X;
@@ -99,18 +126,19 @@ void InputServer::applyInput(const InputPacket& p) {
     r.sThumbLX = scaleAxis(p.circle_x);
     r.sThumbLY = scaleAxis(p.circle_y); // si va invertido, negar aqui
 
-    // Stick derecho y R3, ya calculados en el cliente desde la pantalla tactil.
-    r.sThumbRX = p.right_x;
-    r.sThumbRY = p.right_y;
-    if (p.vbuttons & VBTN_R3) r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;
+    if (!desktop) {  // stick derecho + R3 solo en modo juego (en escritorio = raton)
+        r.sThumbRX = p.right_x;
+        r.sThumbRY = p.right_y;
+        if (p.vbuttons & VBTN_R3) r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;
+    }
 
     vigem_target_x360_update((PVIGEM_CLIENT)client_, (PVIGEM_TARGET)pad_, r);
 #else
     // Sin ViGEm: traza throttled para verificar el canal de input.
     static int n = 0;
     if ((n++ % 30) == 0) {
-        fprintf(stderr, "[input] seq=%u btn=0x%06X cx=%d cy=%d rstick=(%d,%d) vbtn=0x%02X\n",
-                p.seq, p.buttons, p.circle_x, p.circle_y, p.right_x, p.right_y, p.vbuttons);
+        fprintf(stderr, "[input] seq=%u btn=0x%06X mode=%u r=(%d,%d) vbtn=0x%02X\n",
+                p.seq, p.buttons, p.mode, p.right_x, p.right_y, p.vbuttons);
     }
 #endif
 }
