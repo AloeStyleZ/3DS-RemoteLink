@@ -51,7 +51,7 @@ static bool sendAll(SOCKET s, const void* buf, int n) {
 
 // Bloquea hasta que un 3DS conecta y completa el handshake.
 // Rellena clientAddr (IP del 3DS) y el ServerHello acordado.
-static bool doHandshake(int outputIndex, bool wantJpeg, int fps, int quality,
+static bool doHandshake(int outputIndex, bool wantJpeg, bool wantEtc1, int fps, int quality,
                         sockaddr_in& clientAddr, ServerHello& sh) {
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET) return false;
@@ -94,7 +94,8 @@ static bool doHandshake(int outputIndex, bool wantJpeg, int fps, int quality,
         w = VIDEO_DEFAULT_W; h = VIDEO_DEFAULT_H;
     }
     uint8_t codec = CODEC_RAW_YUV420;
-    if (wantJpeg && (ch.codec_caps & (1u << 1))) codec = CODEC_JPEG_YCBCR;
+    if (wantJpeg && (ch.codec_caps & CODEC_CAP_JPEG)) codec = CODEC_JPEG_YCBCR;
+    if (wantEtc1 && (ch.codec_caps & CODEC_CAP_ETC1)) codec = CODEC_ETC1;
 
     memset(&sh, 0, sizeof(sh));
     sh.magic            = PROTO_MAGIC;
@@ -171,13 +172,40 @@ static void drawCursorMarker(YuvFrame& f, int cx, int cy) {
     }
 }
 
+// Igual que drawCursorMarker, pero sobre un RgbFrame (modo ETC1: sin YUV).
+static void drawCursorMarkerRgb(RgbFrame& f, int cx, int cy) {
+    const int H = (int)(sizeof(CURSOR_MASK) / sizeof(CURSOR_MASK[0]));
+    for (int ry = 0; ry < H; ++ry) {
+        const char* row = CURSOR_MASK[ry];
+        const int W = (int)strlen(row);
+        for (int rx = 0; rx < W; ++rx) {
+            if (row[rx] != '1') continue;
+            bool edge = false;
+            if (rx == 0     || row[rx - 1] != '1') edge = true;
+            if (rx == W - 1 || row[rx + 1] != '1') edge = true;
+            if (ry == 0) edge = true;
+            else { const char* up = CURSOR_MASK[ry - 1]; if (rx >= (int)strlen(up) || up[rx] != '1') edge = true; }
+            if (ry == H - 1) edge = true;
+            else { const char* dn = CURSOR_MASK[ry + 1]; if (rx >= (int)strlen(dn) || dn[rx] != '1') edge = true; }
+
+            const int x = cx + rx, y = cy + ry;
+            if (x < 0 || y < 0 || x >= f.w || y >= f.h) continue;
+            uint8_t* p = f.rgb.data() + (size_t)y * f.stride() + (size_t)x * 3;
+            const uint8_t v = edge ? 0 : 255;
+            p[0] = v; p[1] = v; p[2] = v;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     int  outputIndex = 0;
     bool wantJpeg = false;
+    bool wantEtc1 = false;
     int  fps = 30;
     int  quality = 55;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--jpeg")) wantJpeg = true;
+        else if (!strcmp(argv[i], "--etc1")) wantEtc1 = true;
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) outputIndex = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quality") && i + 1 < argc) quality = atoi(argv[++i]);
@@ -193,7 +221,7 @@ int main(int argc, char** argv) {
 
     sockaddr_in clientAddr{};
     ServerHello sh{};
-    if (!doHandshake(outputIndex, wantJpeg, fps, quality, clientAddr, sh)) { WSACleanup(); return 1; }
+    if (!doHandshake(outputIndex, wantJpeg, wantEtc1, fps, quality, clientAddr, sh)) { WSACleanup(); return 1; }
 
     // Socket UDP de video (solo envio).
     SOCKET videoSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -224,8 +252,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const bool etc1Mode = (cfg.codec == CODEC_ETC1);
     YuvFrame cur;
-    cur.alloc(cfg.width, cfg.height);
+    RgbFrame curRgb;
+    if (etc1Mode) curRgb.alloc(cfg.width, cfg.height);
+    else          cur.alloc(cfg.width, cfg.height);
 
     const auto frameDur = std::chrono::milliseconds(1000 / sh.fps);
     fprintf(stderr, "[main] streaming a %d fps. Ctrl+C para salir.\n", sh.fps);
@@ -240,22 +271,30 @@ int main(int argc, char** argv) {
         CapturedFrame f;
         if (capture.capture(f, (uint32_t)frameDur.count())) {
             if (f.valid) {
-                bgraToI420Scaled(f.bgra, f.width, f.height, f.rowPitch, cur);
-                capture.endFrame();          // libera el mapeo cuanto antes
-                if (input.isDesktop()) {     // componer el cursor (modo escritorio)
+                int sx = -1, sy = -1;
+                if (input.isDesktop()) {     // posicion del cursor (modo escritorio)
                     POINT pt;
                     if (GetCursorPos(&pt)) {
                         int dw = capture.desktopWidth(), dh = capture.desktopHeight();
                         if (dw > 0 && dh > 0) {
-                            int sx = (int)((long long)pt.x * cfg.width  / dw);
-                            int sy = (int)((long long)pt.y * cfg.height / dh);
+                            sx = (int)((long long)pt.x * cfg.width  / dw);
+                            sy = (int)((long long)pt.y * cfg.height / dh);
                             if (sx < 0) sx = 0; else if (sx >= cfg.width)  sx = cfg.width  - 1;
                             if (sy < 0) sy = 0; else if (sy >= cfg.height) sy = cfg.height - 1;
-                            drawCursorMarker(cur, sx, sy);
                         }
                     }
                 }
-                sender.sendFrame(cur);
+                if (etc1Mode) {
+                    bgraToRgbScaled(f.bgra, f.width, f.height, f.rowPitch, curRgb);
+                    capture.endFrame();
+                    if (sx >= 0) drawCursorMarkerRgb(curRgb, sx, sy);
+                    sender.sendFrameEtc1(curRgb);
+                } else {
+                    bgraToI420Scaled(f.bgra, f.width, f.height, f.rowPitch, cur);
+                    capture.endFrame();          // libera el mapeo cuanto antes
+                    if (sx >= 0) drawCursorMarker(cur, sx, sy);
+                    sender.sendFrame(cur);
+                }
                 ++frames;
             }
         } else {

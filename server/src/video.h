@@ -1,4 +1,4 @@
-// Emisor de video: diff de tiles -> codificacion (RAW YUV420 o JPEG) ->
+// Emisor de video: diff de tiles -> codificacion (RAW YUV420, JPEG o ETC1) ->
 // fragmentacion en datagramas UDP segun protocol.h.
 #pragma once
 #include "convert.h"
@@ -11,7 +11,7 @@ struct VideoConfig {
     int      height = 240;
     int      tileW  = 80;
     int      tileH  = 80;
-    uint8_t  codec  = 0;   // CODEC_RAW_YUV420 / CODEC_JPEG_YCBCR
+    uint8_t  codec  = 0;   // CODEC_RAW_YUV420 / CODEC_JPEG_YCBCR / CODEC_ETC1
     uint8_t  keyframeInterval = 30;
     int      jpegQuality = 55;
 };
@@ -22,9 +22,16 @@ public:
     // sock: UDP ya creado. dst: destino (IP:puerto del 3DS).
     bool init(SOCKET sock, const sockaddr_in& dst, const VideoConfig& cfg);
 
-    // Procesa un frame YUV ya convertido: detecta tiles sucios y los envia.
-    // forceKey fuerza un keyframe (todos los tiles).
+    // Procesa un frame YUV ya convertido (RAW/JPEG): detecta tiles sucios y los
+    // envia. forceKey fuerza un keyframe (todos los tiles).
     void sendFrame(const YuvFrame& cur, bool forceKey = false);
+
+    // Igual que arriba, pero para el codec ETC1 (fuente RGB888, sin YUV).
+    void sendFrameEtc1(const RgbFrame& cur, bool forceKey = false);
+
+    // Ajustes en vivo (desde mensajes de control del cliente).
+    void setQuality(int q)          { if (q < 10) q = 10; if (q > 95) q = 95; cfg_.jpegQuality = q; }
+    void setKeyframeInterval(int n) { if (n < 1) n = 1;  cfg_.keyframeInterval = (uint8_t)n; }
 
     int tilesX() const { return tilesX_; }
     int tilesY() const { return tilesY_; }
@@ -50,4 +57,10 @@ private:
     unsigned char* jpegBuf_ = nullptr;   // buffer de salida JPEG
     unsigned long  jpegCap_ = 0;
 #endif
+
+    // --- Estado especifico de ETC1 ---
+    RgbFrame             prevRgb_;
+    std::vector<uint8_t> dirtyRgb_;
+    std::vector<uint8_t> tileBufRgb_;   // RGB888 del tile actual
+    std::vector<uint8_t> etc1Buf_;      // salida ETC1 del tile actual (tamano fijo)
 };

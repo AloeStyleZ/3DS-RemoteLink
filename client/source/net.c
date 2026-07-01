@@ -71,7 +71,7 @@ bool net_handshake(const char* server_ip, ServerHello* out) {
     ch.version        = PROTO_VERSION;
     ch.want_width     = STREAM_WIDTH;
     ch.want_height    = STREAM_HEIGHT;
-    ch.codec_caps     = (1u << 0) | (1u << 1); // soporta RAW YUV420 y JPEG
+    ch.codec_caps     = CODEC_CAP_RAW | CODEC_CAP_JPEG | CODEC_CAP_ETC1;
     ch.udp_video_port = PORT_VIDEO;
     ch.udp_input_port = PORT_INPUT;
     ch.max_kbps       = 6000;

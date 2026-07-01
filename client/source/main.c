@@ -61,7 +61,7 @@ static void stream_loop(const ServerHello* sh) {
     C2D_TextOptimize(&tTrackHint);C2D_TextOptimize(&tHint);
 
     VideoDecoder dec;
-    if (!video_init(&dec, sh->width, sh->height, sh->tile_w, sh->tile_h)) {
+    if (!video_init(&dec, sh->width, sh->height, sh->tile_w, sh->tile_h, sh->codec)) {
         printf("video_init fallo\n");
         C2D_TextBufDelete(dynBuf); C2D_TextBufDelete(textBuf); C2D_Fini(); C3D_Fini();
         return;
@@ -256,7 +256,7 @@ int main(void) {
         if (net_handshake(SERVER_IP, &sh)) {
             printf("OK: %ux%u codec=%u tiles=%ux%u fps=%u\n",
                    sh.width, sh.height, sh.codec, sh.tiles_x, sh.tiles_y, sh.fps);
-            if (sh.codec != CODEC_RAW_YUV420 && sh.codec != CODEC_JPEG_YCBCR) {
+            if (sh.codec != CODEC_RAW_YUV420 && sh.codec != CODEC_JPEG_YCBCR && sh.codec != CODEC_ETC1) {
                 printf("Codec no soportado: %u\n", sh.codec);
             } else if (net_open_streams(SERVER_IP, &sh)) {
                 stream_loop(&sh);

@@ -109,3 +109,62 @@ size_t extractTile(const YuvFrame& f, int tx, int ty, int tileW, int tileH,
     }
     return need;
 }
+
+// =============================================================================
+// Pipeline RGB888 (codec ETC1): sin conversion de color, solo reordenar B,G,R,A
+// -> R,G,B y escalar. Evita la perdida de croma del YUV420, relevante porque
+// ETC1 no tiene margen de calidad ajustable (tasa fija).
+// =============================================================================
+
+void bgraToRgbScaled(const uint8_t* src, int sw, int sh, int sp, RgbFrame& d) {
+    const int dw = d.w, dh = d.h;
+    std::vector<int> xmap(dw);
+    for (int x = 0; x < dw; ++x) xmap[x] = ((x * sw) / dw) * 4;
+
+    for (int y = 0; y < dh; ++y) {
+        const uint8_t* srow = src + (size_t)((y * sh) / dh) * sp;
+        uint8_t* drow = d.rgb.data() + (size_t)y * d.stride();
+        for (int x = 0; x < dw; ++x) {
+            const uint8_t* p = srow + xmap[x]; // B,G,R,A
+            uint8_t* q = drow + x * 3;
+            q[0] = p[2]; q[1] = p[1]; q[2] = p[0]; // R,G,B
+        }
+    }
+}
+
+void computeDirtyTilesRgb(const RgbFrame& cur, const RgbFrame& prev,
+                          int tileW, int tileH, int tilesX, int tilesY,
+                          bool keyframe, std::vector<uint8_t>& dirty) {
+    dirty.assign((size_t)tilesX * tilesY, 0);
+    if (keyframe || prev.w != cur.w || prev.h != cur.h) {
+        std::fill(dirty.begin(), dirty.end(), (uint8_t)1);
+        return;
+    }
+    const int stride = cur.stride();
+    for (int ty = 0; ty < tilesY; ++ty) {
+        for (int tx = 0; tx < tilesX; ++tx) {
+            const int x0 = tx * tileW * 3, y0 = ty * tileH;
+            bool changed = false;
+            for (int r = 0; r < tileH && !changed; ++r) {
+                const uint8_t* ra = cur.rgb.data()  + (size_t)(y0 + r) * stride + x0;
+                const uint8_t* rb = prev.rgb.data() + (size_t)(y0 + r) * stride + x0;
+                changed = memcmp(ra, rb, (size_t)tileW * 3) != 0;
+            }
+            dirty[(size_t)ty * tilesX + tx] = changed ? 1 : 0;
+        }
+    }
+}
+
+size_t extractTileRgb(const RgbFrame& f, int tx, int ty, int tileW, int tileH,
+                      std::vector<uint8_t>& out) {
+    const size_t need = (size_t)tileW * tileH * 3;
+    out.resize(need);
+    const int x0 = tx * tileW * 3, y0 = ty * tileH;
+    const int stride = f.stride();
+    uint8_t* dst = out.data();
+    for (int r = 0; r < tileH; ++r) {
+        memcpy(dst, f.rgb.data() + (size_t)(y0 + r) * stride + x0, (size_t)tileW * 3);
+        dst += tileW * 3;
+    }
+    return need;
+}

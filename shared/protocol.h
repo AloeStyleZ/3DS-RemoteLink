@@ -73,8 +73,19 @@ enum {
 
 /* --- Codecs del payload de video (campo `codec`) -------------------------- */
 enum {
-    CODEC_RAW_YUV420 = 0,  /* planos Y||U||V crudos del tile (CPU ~0 en 3DS)   */
-    CODEC_JPEG_YCBCR = 1    /* JPEG del tile, salida en planos YCbCr (sin RGB) */
+    CODEC_RAW_YUV420 = 0,  /* planos Y||U||V crudos del tile (CPU ~0 en 3DS)    */
+    CODEC_JPEG_YCBCR = 1,  /* JPEG del tile, salida en planos YCbCr (sin RGB)   */
+    CODEC_ETC1       = 2   /* bloques ETC1 (4x4 px, 8 bytes) - decode 100% GPU  */
+};
+#define ETC1_BLOCK_BYTES 8   /* bytes de un bloque ETC1 (4x4 px). Compartido    *
+                              * entre el encoder (servidor) y el swizzle        *
+                              * (cliente).                                      */
+
+/* Bits de codec_caps en ClientHello (que codecs sabe decodificar el cliente). */
+enum {
+    CODEC_CAP_RAW  = 1u << 0,
+    CODEC_CAP_JPEG = 1u << 1,
+    CODEC_CAP_ETC1 = 1u << 2
 };
 
 /* =============================================================================
@@ -230,7 +241,7 @@ typedef struct {
     u8  version;          /* PROTO_VERSION                                     */
     u16 want_width;       /* resolucion deseada (p.ej. 400)                    */
     u16 want_height;      /* (p.ej. 240)                                       */
-    u16 codec_caps;       /* bitmask: bit0=RAW_YUV420, bit1=JPEG               */
+    u16 codec_caps;       /* bitmask CODEC_CAP_* (que codecs decodifica el cliente) */
     u16 udp_video_port;   /* puerto donde el 3DS escuchara video (8000)        */
     u16 udp_input_port;   /* puerto desde el que el 3DS enviara input (8001)   */
     u32 max_kbps;         /* techo de ancho de banda que el cliente acepta     */

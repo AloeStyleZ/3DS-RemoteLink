@@ -9,40 +9,68 @@ static u16 next_pow2(u16 v) {
     return p;
 }
 
-bool video_init(VideoDecoder* d, int w, int h, int tileW, int tileH) {
+bool video_init(VideoDecoder* d, int w, int h, int tileW, int tileH, u8 codec) {
     memset(d, 0, sizeof(*d));
     d->width = w;  d->height = h;
     d->tileW = tileW; d->tileH = tileH;
     d->tilesX = w / tileW; d->tilesY = h / tileH;
     d->tileCount = d->tilesX * d->tilesY;
-    d->ySize = (size_t)w * h;
-    d->cSize = (size_t)(w / 2) * (h / 2);
-    d->maxTileBytes = tileW * tileH + 2 * (tileW / 2) * (tileH / 2);
+    d->codec = codec;
 
-    // Planos I420 en memoria lineal (requerido por el DMA del Y2R).
-    d->y = (u8*)linearAlloc(d->ySize);
-    d->u = (u8*)linearAlloc(d->cSize);
-    d->v = (u8*)linearAlloc(d->cSize);
-    if (!d->y || !d->u || !d->v) return false;
-    memset(d->y, 16,  d->ySize);   // negro en YUV: Y=16, U=V=128
-    memset(d->u, 128, d->cSize);
-    memset(d->v, 128, d->cSize);
+    u16 tw = next_pow2((u16)w), th = next_pow2((u16)h);
 
-    d->reasm = (TileReasm*)calloc(d->tileCount, sizeof(TileReasm));
-    if (!d->reasm) return false;
-    for (int i = 0; i < d->tileCount; ++i) {
-        d->reasm[i].frameId = 0xFFFF;
-        d->reasm[i].buf = (u8*)malloc(d->maxTileBytes);
-        if (!d->reasm[i].buf) return false;
+    if (codec == CODEC_ETC1) {
+        // Sin YUV, sin Y2R: el bloque ETC1 ya es la textura (la GPU lo descomprime
+        // al muestrear). El "tile" reensamblado es directamente el chorro de
+        // bloques (20x20 para un tile de 80x80), a colocar con el swizzle del
+        // PICA200 (bloques agrupados en super-tiles de 2x2, en orden Z).
+        d->blocksPerTileRow = tileW / 4;
+        d->blocksPerTileCol = tileH / 4;
+        d->potBlocksPerRow  = tw / 4;
+        d->maxTileBytes = d->blocksPerTileRow * d->blocksPerTileCol * ETC1_BLOCK_BYTES;
+
+        if (!C3D_TexInit(&d->tex, tw, th, GPU_ETC1)) return false;
+        memset(d->tex.data, 0, d->tex.size);
+    } else {
+        d->ySize = (size_t)w * h;
+        d->cSize = (size_t)(w / 2) * (h / 2);
+        d->maxTileBytes = tileW * tileH + 2 * (tileW / 2) * (tileH / 2);
+
+        // Planos I420 en memoria lineal (requerido por el DMA del Y2R).
+        d->y = (u8*)linearAlloc(d->ySize);
+        d->u = (u8*)linearAlloc(d->cSize);
+        d->v = (u8*)linearAlloc(d->cSize);
+        if (!d->y || !d->u || !d->v) return false;
+        memset(d->y, 16,  d->ySize);   // negro en YUV: Y=16, U=V=128
+        memset(d->u, 128, d->cSize);
+        memset(d->v, 128, d->cSize);
+
+        if (!C3D_TexInit(&d->tex, tw, th, GPU_RGB565)) return false;
+        memset(d->tex.data, 0, d->tex.size);
+
+        // --- Y2R: YUV420 planar (8b) -> RGB565, salida tiled (BLOCK_8_BY_8) ---
+        if (R_FAILED(y2rInit())) return false;
+        Y2RU_SetInputFormat(INPUT_YUV420_INDIV_8);
+        Y2RU_SetOutputFormat(OUTPUT_RGB_16_565);
+        Y2RU_SetRotation(ROTATION_NONE);
+        Y2RU_SetBlockAlignment(BLOCK_8_BY_8);
+        Y2RU_SetTransferEndInterrupt(true);
+        Y2RU_SetInputLineWidth((u16)w);
+        Y2RU_SetInputLines((u16)h);
+        // El servidor genera Y en rango estudio (16-235, formula BT.601 con +16),
+        // asi que usamos la variante _SCALING que expande 16-235 -> 0-255. Si los
+        // colores salen lavados/saturados, prueba COEFFICIENT_ITU_R_BT_601.
+        Y2RU_SetStandardCoefficient(COEFFICIENT_ITU_R_BT_601_SCALING);
+        Y2RU_SetAlpha(0xFF);
+        Y2RU_GetTransferEndEvent(&d->y2rEvent);
+
+        // Decoder JPEG (para codec CODEC_JPEG_YCBCR).
+        d->tjDec = tjInitDecompress();
+        if (!d->tjDec) return false;
     }
 
-    // Textura POT (p.ej. 512x256) que contiene la imagen en su esquina sup-izq.
-    u16 tw = next_pow2((u16)w), th = next_pow2((u16)h);
-    if (!C3D_TexInit(&d->tex, tw, th, GPU_RGB565)) return false;
     C3D_TexSetFilter(&d->tex, GPU_LINEAR, GPU_LINEAR);
     C3D_TexSetWrap(&d->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-    memset(d->tex.data, 0, d->tex.size);
-
     d->subtex.width  = (u16)w;
     d->subtex.height = (u16)h;
     d->subtex.left   = 0.0f;
@@ -52,31 +80,19 @@ bool video_init(VideoDecoder* d, int w, int h, int tileW, int tileH) {
     d->img.tex    = &d->tex;
     d->img.subtex = &d->subtex;
 
-    // --- Y2R: YUV420 planar (8b) -> RGB565, salida tiled (BLOCK_8_BY_8) ---
-    if (R_FAILED(y2rInit())) return false;
-    Y2RU_SetInputFormat(INPUT_YUV420_INDIV_8);
-    Y2RU_SetOutputFormat(OUTPUT_RGB_16_565);
-    Y2RU_SetRotation(ROTATION_NONE);
-    Y2RU_SetBlockAlignment(BLOCK_8_BY_8);
-    Y2RU_SetTransferEndInterrupt(true);
-    Y2RU_SetInputLineWidth((u16)w);
-    Y2RU_SetInputLines((u16)h);
-    // El servidor genera Y en rango estudio (16-235, formula BT.601 con +16), asi
-    // que usamos la variante _SCALING que expande 16-235 -> 0-255. Si los colores
-    // salen lavados/saturados, prueba COEFFICIENT_ITU_R_BT_601 (sin scaling).
-    Y2RU_SetStandardCoefficient(COEFFICIENT_ITU_R_BT_601_SCALING);
-    Y2RU_SetAlpha(0xFF);
-    Y2RU_GetTransferEndEvent(&d->y2rEvent);
-
-    // Decoder JPEG (para codec CODEC_JPEG_YCBCR).
-    d->tjDec = tjInitDecompress();
-    if (!d->tjDec) return false;
+    d->reasm = (TileReasm*)calloc(d->tileCount, sizeof(TileReasm));
+    if (!d->reasm) return false;
+    for (int i = 0; i < d->tileCount; ++i) {
+        d->reasm[i].frameId = 0xFFFF;
+        d->reasm[i].buf = (u8*)malloc(d->maxTileBytes);
+        if (!d->reasm[i].buf) return false;
+    }
     return true;
 }
 
 void video_exit(VideoDecoder* d) {
     if (d->tjDec) tjDestroy((tjhandle)d->tjDec);
-    y2rExit();
+    if (d->codec != CODEC_ETC1) y2rExit();
     C3D_TexDelete(&d->tex);
     if (d->reasm) {
         for (int i = 0; i < d->tileCount; ++i) free(d->reasm[i].buf);
@@ -109,6 +125,37 @@ static void unpack_tile_raw(VideoDecoder* d, int tx, int ty, const u8* blob) {
     }
 }
 
+// Offset (en bytes) del bloque ETC1 en (bx,by) dentro de la textura POT, segun
+// el tiling del PICA200: super-tiles de 8x8 pixeles (2x2 bloques) en orden
+// row-major, y dentro de cada super-tile los 4 bloques en orden TL,TR,BL,BR
+// (que para una rejilla 2x2 coincide con Z-order). Verificado contra el loop
+// de encode.cpp de tex3ds (source/encode.cpp, funcion etc1_common) y contra el
+// mismo patron "fila de tiles + hueco" que ya usa Y2R en video_present().
+static inline u32 etc1BlockOffset(int bx, int by, int potBlocksPerRow) {
+    const int superX = bx >> 1, superY = by >> 1;
+    const int wx = bx & 1, wy = by & 1;
+    const int superPerRow = potBlocksPerRow >> 1;
+    const int superIndex = superY * superPerRow + superX;
+    const int localBlock = wy * 2 + wx; // 0=TL 1=TR 2=BL 3=BR
+    return (u32)(superIndex * 4 + localBlock) * ETC1_BLOCK_BYTES;
+}
+
+// Coloca los bloques ETC1 de un tile (recibidos en `blob`, en orden de lectura
+// fila-a-fila) en la textura, en el offset swizzled que espera la GPU. Sin
+// decode real: cada bloque de 8 bytes se copia tal cual, la GPU lo descomprime
+// sola al muestrear -> coste de CPU minimo (solo el propio swizzle/memcpy).
+static void decode_tile_etc1(VideoDecoder* d, int tx, int ty, const u8* blob) {
+    const int bpr = d->blocksPerTileRow, bpc = d->blocksPerTileCol;
+    const int baseBx = tx * bpr, baseBy = ty * bpc;
+    for (int ly = 0; ly < bpc; ++ly) {
+        for (int lx = 0; lx < bpr; ++lx) {
+            const u32 off = etc1BlockOffset(baseBx + lx, baseBy + ly, d->potBlocksPerRow);
+            memcpy((u8*)d->tex.data + off, blob + (size_t)(ly * bpr + lx) * ETC1_BLOCK_BYTES,
+                   ETC1_BLOCK_BYTES);
+        }
+    }
+}
+
 // Decodifica un tile JPEG (4:2:0) DIRECTAMENTE en los planos persistentes, en la
 // posicion del tile. Reusa la API simetrica a la del servidor (tjCompressFromYUVPlanes).
 static void decode_tile_jpeg(VideoDecoder* d, int tx, int ty,
@@ -125,8 +172,18 @@ static void decode_tile_jpeg(VideoDecoder* d, int tx, int ty,
                             d->tileW, strides, d->tileH, TJFLAG_FASTDCT);
 }
 
-// Convierte los planos I420 -> textura RGB565 mediante el HW Y2R.
+// Convierte los planos I420 -> textura RGB565 mediante el HW Y2R (o, en modo
+// ETC1, simplemente publica los bloques ya escritos: no hay conversion que
+// hacer, la GPU descomprime ETC1 sola al muestrear la textura).
 static void video_present(VideoDecoder* d) {
+    if (d->codec == CODEC_ETC1) {
+        // Los memcpy de decode_tile_etc1 pasaron por la cache de datos de la CPU;
+        // hay que volcarla a RAM para que la GPU vea los bytes al texturizar.
+        GSPGPU_FlushDataCache(d->tex.data, d->tex.size);
+        d->ready = true;
+        return;
+    }
+
     // El Y2R lee por DMA: hay que volcar la cache CPU a RAM antes.
     GSPGPU_FlushDataCache(d->y, d->ySize);
     GSPGPU_FlushDataCache(d->u, d->cSize);
@@ -163,7 +220,7 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
     memcpy(&h, pkt, sizeof(h)); // copia para evitar accesos desalineados
     if (h.magic != PROTO_MAGIC || h.type != PKT_VIDEO) return false;
     if (h.tile_id >= d->tileCount)        return false;
-    if (h.codec != CODEC_RAW_YUV420 && h.codec != CODEC_JPEG_YCBCR) return false;
+    if (h.codec != CODEC_RAW_YUV420 && h.codec != CODEC_JPEG_YCBCR && h.codec != CODEC_ETC1) return false;
     if (h.frag_index >= MAX_FRAGS_PER_TILE) return false;
 
     const u8* payload = pkt + sizeof(VideoPktHeader);
@@ -193,6 +250,8 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
                 const int ty = h.tile_id / d->tilesX;
                 if (h.codec == CODEC_JPEG_YCBCR)
                     decode_tile_jpeg(d, tx, ty, r->buf, r->tileBytes);
+                else if (h.codec == CODEC_ETC1)
+                    decode_tile_etc1(d, tx, ty, r->buf);
                 else
                     unpack_tile_raw(d, tx, ty, r->buf);
                 // Hay datos nuevos -> presentar. NO esperamos al FRAME_END (que
