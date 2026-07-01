@@ -10,6 +10,8 @@
 #include <ViGEm/Client.h>
 #endif
 
+static void typeText(const char* utf8, int len);   // def mas abajo
+
 InputServer::~InputServer() {
     stop();
 }
@@ -51,23 +53,45 @@ void InputServer::stop() {
 #endif
 }
 
+void InputServer::markActive() { lastInputMs_.store(GetTickCount64()); }
+bool InputServer::clientActive(unsigned long long timeoutMs) const {
+    return (GetTickCount64() - lastInputMs_.load()) < timeoutMs;
+}
+
 void InputServer::runLoop() {
-    char buf[128];
+    char buf[512];
     while (running_) {
         sockaddr_in from{}; int fromLen = sizeof(from);
         int n = recvfrom(sock_, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen);
-        if (n == SOCKET_ERROR) continue; // timeout o error transitorio
-        if (n < (int)sizeof(InputPacket)) continue;
+        if (n == SOCKET_ERROR || n < 2) continue;
+        const unsigned char ptype = (unsigned char)buf[1];
 
-        InputPacket p;
-        memcpy(&p, buf, sizeof(p));
-        if (p.magic != PROTO_MAGIC || p.type != PKT_INPUT) continue;
-
-        // Descartar paquetes atrasados (UDP puede reordenar).
-        if (haveSeq_ && !seq_is_newer(p.seq, lastSeq_)) continue;
-        lastSeq_ = p.seq; haveSeq_ = true;
-
-        applyInput(p);
+        if (ptype == PKT_INPUT && n >= (int)sizeof(InputPacket)) {
+            InputPacket p;
+            memcpy(&p, buf, sizeof(p));
+            if (p.magic != PROTO_MAGIC) continue;
+            markActive();   // el cliente sigue vivo
+            // Descartar paquetes atrasados (UDP puede reordenar).
+            if (haveSeq_ && !seq_is_newer(p.seq, lastSeq_)) continue;
+            lastSeq_ = p.seq; haveSeq_ = true;
+            applyInput(p);
+        } else if (ptype == PKT_CTRL && n >= (int)sizeof(CtrlPacket)) {
+            CtrlPacket c;
+            memcpy(&c, buf, sizeof(c));
+            if (c.magic != PROTO_MAGIC) continue;
+            if      (c.ctrl_code == CTRL_SET_QUALITY)      qualityReq_.store((int)c.arg);
+            else if (c.ctrl_code == CTRL_SET_FPS)          fpsReq_.store((int)c.arg);
+            else if (c.ctrl_code == CTRL_REQUEST_KEYFRAME) keyframeReq_.store(true);
+        } else if (ptype == PKT_TEXT && n >= (int)sizeof(TextPacketHeader)) {
+            TextPacketHeader h;
+            memcpy(&h, buf, sizeof(h));
+            if (h.magic != PROTO_MAGIC) continue;
+            if ((int)h.seq == lastTextSeq_) continue;   // duplicado (se envian 2 copias)
+            lastTextSeq_ = (int)h.seq;
+            int textLen = (int)h.len;
+            if (textLen > n - (int)sizeof(TextPacketHeader)) textLen = n - (int)sizeof(TextPacketHeader);
+            if (textLen > 0) typeText(buf + sizeof(TextPacketHeader), textLen);
+        }
     }
 }
 
@@ -75,6 +99,19 @@ static inline short scaleAxis(int v) {
     // Circle pad 3DS (~ +-156) -> eje Xbox (+-32767).
     int s = (v * 32767) / 156;
     return (short)std::max(-32767, std::min(32767, s));
+}
+
+// Teclea un texto UTF-8 en el PC via SendInput (eventos de teclado Unicode).
+static void typeText(const char* utf8, int len) {
+    wchar_t w[512];
+    int wn = MultiByteToWideChar(CP_UTF8, 0, utf8, len, w, 512);
+    for (int i = 0; i < wn; ++i) {
+        INPUT in[2];
+        memset(in, 0, sizeof(in));
+        in[0].type = INPUT_KEYBOARD; in[0].ki.wScan = w[i]; in[0].ki.dwFlags = KEYEVENTF_UNICODE;
+        in[1] = in[0]; in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        SendInput(2, in, sizeof(INPUT));
+    }
 }
 
 void InputServer::applyInput(const InputPacket& p) {
@@ -93,16 +130,19 @@ void InputServer::applyInput(const InputPacket& p) {
             mi.mi.dwFlags = MOUSEEVENTF_MOVE;   // movimiento relativo (trackpad)
             SendInput(1, &mi, sizeof(INPUT));
         }
+        // Clic izquierdo: mantenido mientras el cliente lo indique (boton tactil).
         const bool lclick = (p.vbuttons & VBTN_LCLICK) != 0;
-        if (lclick && !prevLClick_) {            // flanco -> clic completo (down+up)
-            INPUT cl[2]; memset(cl, 0, sizeof(cl));
-            cl[0].type = INPUT_MOUSE; cl[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-            cl[1].type = INPUT_MOUSE; cl[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-            SendInput(2, cl, sizeof(INPUT));
-        }
+        if (lclick && !prevLClick_) { INPUT d; memset(&d,0,sizeof(d)); d.type=INPUT_MOUSE; d.mi.dwFlags=MOUSEEVENTF_LEFTDOWN;  SendInput(1,&d,sizeof(INPUT)); }
+        if (!lclick && prevLClick_) { INPUT u; memset(&u,0,sizeof(u)); u.type=INPUT_MOUSE; u.mi.dwFlags=MOUSEEVENTF_LEFTUP;    SendInput(1,&u,sizeof(INPUT)); }
         prevLClick_ = lclick;
+        // Clic derecho (doble tap en el cliente).
+        const bool rclick = (p.vbuttons & VBTN_RCLICK) != 0;
+        if (rclick && !prevRClick_) { INPUT d; memset(&d,0,sizeof(d)); d.type=INPUT_MOUSE; d.mi.dwFlags=MOUSEEVENTF_RIGHTDOWN; SendInput(1,&d,sizeof(INPUT)); }
+        if (!rclick && prevRClick_) { INPUT u; memset(&u,0,sizeof(u)); u.type=INPUT_MOUSE; u.mi.dwFlags=MOUSEEVENTF_RIGHTUP;   SendInput(1,&u,sizeof(INPUT)); }
+        prevRClick_ = rclick;
     } else {
         prevLClick_ = false;
+        prevRClick_ = false;
     }
 
 #ifdef HAVE_VIGEM

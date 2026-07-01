@@ -27,6 +27,7 @@ typedef struct VideoDecoder {
     size_t ySize, cSize;
 
     TileReasm* reasm;
+    u8*        rleScratch;   // buffer temporal para expandir RLE -> blob raw (maxTileBytes)
 
     // Salida: textura POT RGB565 envuelta como C2D_Image.
     C3D_Tex           tex;
@@ -37,6 +38,8 @@ typedef struct VideoDecoder {
     bool   ready;          // hay al menos un frame valido en la textura
     bool   pendingPresent; // llego un FRAME_END; falta hacer Y2R+present
     void*  tjDec;          // tjhandle de decompresion JPEG (turbojpeg)
+    volatile u32 framesPresented; // contador de frames presentados (para FPS entre hilos)
+    volatile u32 droppedTiles;    // tiles que quedaron incompletos (perdida -> pedir keyframe)
 } VideoDecoder;
 
 bool video_init(VideoDecoder* d, int w, int h, int tileW, int tileH);

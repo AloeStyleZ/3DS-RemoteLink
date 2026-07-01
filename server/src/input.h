@@ -21,6 +21,17 @@ public:
     // true si el cliente pidio audio. Lo lee el AudioSender para enviar o no.
     bool audioEnabled() const { return audio_.load(); }
 
+    // Ultima calidad/fps pedidos por el cliente (0 = sin peticion). Los aplica el loop.
+    int qualityReq() const { return qualityReq_.load(); }
+    int fpsReq()     const { return fpsReq_.load(); }
+
+    // Devuelve y limpia la peticion de keyframe (el cliente la pide al perder datos).
+    bool takeKeyframeReq() { return keyframeReq_.exchange(false); }
+
+    // Actividad del cliente (para detectar desconexion y volver a aceptar handshake).
+    void markActive();
+    bool clientActive(unsigned long long timeoutMs) const;
+
 private:
     void runLoop();
     void applyInput(const InputPacket& p);
@@ -30,9 +41,15 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> desktop_{false};
     std::atomic<bool> audio_{false};
+    std::atomic<int>  qualityReq_{0};
+    std::atomic<int>  fpsReq_{0};
+    std::atomic<bool> keyframeReq_{false};
+    std::atomic<unsigned long long> lastInputMs_{0};
     uint16_t          lastSeq_ = 0;
     bool              haveSeq_ = false;
     bool              prevLClick_ = false;
+    bool              prevRClick_ = false;
+    int               lastTextSeq_ = -1;
 
 #ifdef HAVE_VIGEM
     void* client_ = nullptr;  // PVIGEM_CLIENT
