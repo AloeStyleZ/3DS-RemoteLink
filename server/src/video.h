@@ -1,5 +1,7 @@
-// Emisor de video: diff de tiles -> codificacion (RAW YUV420 o JPEG) ->
-// fragmentacion en datagramas UDP segun protocol.h.
+// Emisor de video: diff de tiles -> codificacion hibrida (RLE para tiles planos
+// tipo UI/menus/texto, JPEG para el resto) -> fragmentacion UDP segun protocol.h.
+// El RLE decodifica casi gratis en el cliente (bucle trivial), asi que se prueba
+// primero; solo cae a JPEG cuando el contenido es demasiado complejo para RLE.
 #pragma once
 #include "convert.h"
 #include <cstdint>
@@ -26,13 +28,22 @@ public:
     // forceKey fuerza un keyframe (todos los tiles).
     void sendFrame(const YuvFrame& cur, bool forceKey = false);
 
+    // Ajustes en vivo (desde mensajes de control del cliente).
+    void setQuality(int q)          { if (q < 10) q = 10; if (q > 95) q = 95; cfg_.jpegQuality = q; }
+    void setKeyframeInterval(int n) { if (n < 1) n = 1;  cfg_.keyframeInterval = (uint8_t)n; }
+
     int tilesX() const { return tilesX_; }
     int tilesY() const { return tilesY_; }
 
 private:
-    // Codifica el tile contenido en tileBuf_ (RAW de tamano rawBytes).
-    // Devuelve puntero+tamano del payload a enviar (RAW o JPEG).
-    const uint8_t* encodeTile(size_t rawBytes, size_t& outBytes);
+    // Codifica el tile contenido en tileBuf_ (RAW de tamano rawBytes) a la
+    // calidad indicada. Devuelve puntero+tamano del payload a enviar (RAW o JPEG).
+    const uint8_t* encodeTile(size_t rawBytes, int quality, size_t& outBytes);
+
+    // Intenta RLE sobre tileBuf_[0..rawBytes). Devuelve bytes escritos en rleBuf_,
+    // o 0 si no compensa (tiles con contenido complejo -> mejor JPEG). Barato:
+    // aborta en cuanto el output supera el umbral, sin terminar de recorrer el tile.
+    size_t tryRle(size_t rawBytes);
 
     SOCKET      sock_ = INVALID_SOCKET;
     sockaddr_in dst_{};
@@ -42,6 +53,9 @@ private:
     YuvFrame             prev_;
     std::vector<uint8_t> dirty_;
     std::vector<uint8_t> tileBuf_;   // RAW I420 del tile actual
+    std::vector<uint8_t> rleBuf_;    // salida RLE del tile actual (si compensa)
+    std::vector<uint8_t> lastQ_;     // calidad con la que se envio cada tile (255 = RLE/lossless)
+    int                  refineCursor_ = 0;
     uint16_t             frameId_ = 0;
     int                  framesSinceKey_ = 0;
 

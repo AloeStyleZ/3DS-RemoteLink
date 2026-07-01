@@ -35,6 +35,8 @@ bool video_init(VideoDecoder* d, int w, int h, int tileW, int tileH) {
         d->reasm[i].buf = (u8*)malloc(d->maxTileBytes);
         if (!d->reasm[i].buf) return false;
     }
+    d->rleScratch = (u8*)malloc(d->maxTileBytes);
+    if (!d->rleScratch) return false;
 
     // Textura POT (p.ej. 512x256) que contiene la imagen en su esquina sup-izq.
     u16 tw = next_pow2((u16)w), th = next_pow2((u16)h);
@@ -82,6 +84,7 @@ void video_exit(VideoDecoder* d) {
         for (int i = 0; i < d->tileCount; ++i) free(d->reasm[i].buf);
         free(d->reasm);
     }
+    free(d->rleScratch);
     if (d->y) linearFree(d->y);
     if (d->u) linearFree(d->u);
     if (d->v) linearFree(d->v);
@@ -107,6 +110,24 @@ static void unpack_tile_raw(VideoDecoder* d, int tx, int ty, const u8* blob) {
         memcpy(d->v + (size_t)(cy + r) * cStride + cx, src, cW);
         src += cW;
     }
+}
+
+// Expande RLE (pares count,value) a un blob crudo en rleScratch y lo desempaqueta
+// igual que un tile RAW. Decodificacion trivial (memset por run): casi gratis
+// en CPU, por eso el servidor prefiere RLE sobre JPEG cuando el tile es "plano"
+// (menus/UI/texto).
+static void decode_tile_rle(VideoDecoder* d, int tx, int ty, const u8* rle, u16 rleSize) {
+    u8* out = d->rleScratch;
+    int oi = 0, i = 0;
+    while (i + 1 < (int)rleSize && oi < d->maxTileBytes) {
+        const u8 run = rle[i], val = rle[i + 1];
+        i += 2;
+        int n = run;
+        if (oi + n > d->maxTileBytes) n = d->maxTileBytes - oi;
+        memset(out + oi, val, (size_t)n);
+        oi += n;
+    }
+    unpack_tile_raw(d, tx, ty, out);
 }
 
 // Decodifica un tile JPEG (4:2:0) DIRECTAMENTE en los planos persistentes, en la
@@ -154,6 +175,7 @@ static void video_present(VideoDecoder* d) {
     // lineas obsoletas no la pisen cuando la GPU la muestree.
     GSPGPU_InvalidateDataCache(d->tex.data, d->tex.size);
     d->ready = true;
+    d->framesPresented++;
 }
 
 bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
@@ -163,7 +185,7 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
     memcpy(&h, pkt, sizeof(h)); // copia para evitar accesos desalineados
     if (h.magic != PROTO_MAGIC || h.type != PKT_VIDEO) return false;
     if (h.tile_id >= d->tileCount)        return false;
-    if (h.codec != CODEC_RAW_YUV420 && h.codec != CODEC_JPEG_YCBCR) return false;
+    if (h.codec != CODEC_RAW_YUV420 && h.codec != CODEC_JPEG_YCBCR && h.codec != CODEC_RLE_YUV420) return false;
     if (h.frag_index >= MAX_FRAGS_PER_TILE) return false;
 
     const u8* payload = pkt + sizeof(VideoPktHeader);
@@ -172,6 +194,10 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
 
     TileReasm* r = &d->reasm[h.tile_id];
     if (r->frameId != h.frame_id) {
+        // Si el frame anterior de este tile quedo incompleto, se perdio algun
+        // fragmento -> lo contamos (el cliente pedira un keyframe si pasa mucho).
+        if (r->frameId != 0xFFFF && r->received > 0 && r->received < r->fragCount)
+            d->droppedTiles++;
         // Nuevo frame para este tile: reinicia su reensamblado.
         r->frameId   = h.frame_id;
         r->fragCount = h.frag_count;
@@ -193,6 +219,8 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
                 const int ty = h.tile_id / d->tilesX;
                 if (h.codec == CODEC_JPEG_YCBCR)
                     decode_tile_jpeg(d, tx, ty, r->buf, r->tileBytes);
+                else if (h.codec == CODEC_RLE_YUV420)
+                    decode_tile_rle(d, tx, ty, r->buf, r->tileBytes);
                 else
                     unpack_tile_raw(d, tx, ty, r->buf);
                 // Hay datos nuevos -> presentar. NO esperamos al FRAME_END (que

@@ -137,20 +137,98 @@ void net_send_input(const InputPacket* p) {
            (struct sockaddr*)&s_inputAddr, sizeof(s_inputAddr));
 }
 
+void net_send_ctrl(u8 code, u32 arg) {
+    if (s_inputSock < 0) return;
+    CtrlPacket c;
+    memset(&c, 0, sizeof(c));
+    c.magic = PROTO_MAGIC; c.type = PKT_CTRL; c.ctrl_code = code; c.arg = arg;
+    for (int i = 0; i < 3; ++i)   // 3 copias por si se pierde un datagrama UDP
+        sendto(s_inputSock, &c, sizeof(c), 0,
+               (struct sockaddr*)&s_inputAddr, sizeof(s_inputAddr));
+}
+
+void net_send_text(const char* s, int len) {
+    if (s_inputSock < 0 || len <= 0) return;
+    if (len > TEXT_MAX) len = TEXT_MAX;
+    static u16 textSeq = 0;
+    textSeq++;
+    static u8 buf[sizeof(TextPacketHeader) + TEXT_MAX];
+    TextPacketHeader* h = (TextPacketHeader*)buf;
+    h->magic = PROTO_MAGIC; h->type = PKT_TEXT; h->seq = textSeq; h->len = (u16)len;
+    memcpy(buf + sizeof(TextPacketHeader), s, (size_t)len);
+    int total = (int)sizeof(TextPacketHeader) + len;
+    for (int i = 0; i < 2; ++i)   // 2 copias con el mismo seq (el server ignora el dup)
+        sendto(s_inputSock, buf, total, 0,
+               (struct sockaddr*)&s_inputAddr, sizeof(s_inputAddr));
+}
+
 bool net_drain_video(struct VideoDecoder* dec) {
     if (s_videoSock < 0) return false;
     static u8 buf[1600];
-    bool frameDone = false;
-    // Cota de paquetes por llamada: garantiza que el bucle SIEMPRE retorne
-    // (aunque lleguen mas rapido de lo que se procesan) para que el render y el
-    // envio de input no se queden bloqueados. Permite recuperar ~14 frames/iter.
+    bool received = false;
+    // Cota de paquetes por llamada: garantiza que el bucle SIEMPRE retorne.
     int budget = 1500;
     while (budget-- > 0) {
         int n = recvfrom(s_videoSock, buf, sizeof(buf), 0, NULL, NULL);
         if (n <= 0) break;             // EWOULDBLOCK / nada mas que leer
-        if (video_on_packet(dec, buf, n)) frameDone = true;
+        received = true;
+        video_on_packet(dec, buf, n);
     }
-    return frameDone;
+    return received;                   // hubo actividad (para detectar desconexion)
+}
+
+void net_close_streams(void) {
+    if (s_videoSock >= 0) { close(s_videoSock); s_videoSock = -1; }
+    if (s_inputSock >= 0) { close(s_inputSock); s_inputSock = -1; }
+    if (s_audioSock >= 0) { close(s_audioSock); s_audioSock = -1; }
+}
+
+// ---------------------------------------------------------------------------
+// Hilo receptor experimental (core1): recv + decode + Y2R en paralelo al render.
+// ---------------------------------------------------------------------------
+#define RX_CPU_LIMIT 70   // % de core1 reservado para la app (tunable; baja si la red sufre)
+
+static Thread          s_rxThread = NULL;
+static volatile bool   s_rxRun    = false;
+static struct VideoDecoder* s_rxDec = NULL;
+
+static void rx_thread_fn(void* arg) {
+    (void)arg;
+    static u8 buf[1600];
+    u64 lastPresent = osGetTime();
+    while (s_rxRun) {
+        int n = recvfrom(s_videoSock, buf, sizeof(buf), 0, NULL, NULL);
+        if (n > 0) {
+            video_on_packet(s_rxDec, buf, n);
+        } else {
+            svcSleepThread(1000000);   // 1ms: nada que leer, no quemar CPU
+        }
+        u64 now = osGetTime();
+        if (now - lastPresent >= 10) {  // presenta como mucho ~100 veces/seg
+            video_update(s_rxDec);
+            lastPresent = now;
+        }
+    }
+}
+
+bool net_start_receiver(struct VideoDecoder* dec) {
+    s_rxDec = dec;
+    s_rxRun = true;
+    // Reservar tiempo del core1 (syscore) para poder crear el hilo ahi.
+    APT_SetAppCpuTimeLimit(RX_CPU_LIMIT);
+    s32 prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    s_rxThread = threadCreate(rx_thread_fn, NULL, 64 * 1024, prio, 1, false); // core1
+    if (!s_rxThread) { s_rxRun = false; return false; }                       // -> fallback
+    return true;
+}
+
+void net_stop_receiver(void) {
+    if (!s_rxThread) return;
+    s_rxRun = false;
+    threadJoin(s_rxThread, UINT64_MAX);
+    threadFree(s_rxThread);
+    s_rxThread = NULL;
 }
 
 void net_drain_audio(void) {

@@ -191,31 +191,12 @@ int main(int argc, char** argv) {
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "WSAStartup fallo\n"); return 1; }
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
 
-    sockaddr_in clientAddr{};
-    ServerHello sh{};
-    if (!doHandshake(outputIndex, wantJpeg, fps, quality, clientAddr, sh)) { WSACleanup(); return 1; }
-
-    // Socket UDP de video (solo envio).
+    // Socket UDP de video (solo envio) y servicios persistentes.
     SOCKET videoSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (videoSock == INVALID_SOCKET) { fprintf(stderr, "socket video fallo\n"); WSACleanup(); return 1; }
 
-    VideoConfig cfg;
-    cfg.width  = sh.width;  cfg.height = sh.height;
-    cfg.tileW  = sh.tile_w; cfg.tileH  = sh.tile_h;
-    cfg.codec  = sh.codec;  cfg.keyframeInterval = sh.keyframe_interval;
-    cfg.jpegQuality = sh.jpeg_quality;
-
-    VideoSender sender;
-    if (!sender.init(videoSock, clientAddr, cfg)) { closesocket(videoSock); WSACleanup(); return 1; }
-
     InputServer input;
     input.start(PORT_INPUT);
-
-    // Audio (WASAPI loopback). Solo envia cuando el cliente lo pide.
-    sockaddr_in audioDst = clientAddr;
-    audioDst.sin_port = htons(PORT_AUDIO);
-    AudioSender audio;
-    audio.start(audioDst);
 
     DesktopCapture capture;
     if (!capture.init(outputIndex)) {
@@ -224,56 +205,93 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    AudioSender audio;
+    bool     audioStarted = false;
     YuvFrame cur;
-    cur.alloc(cfg.width, cfg.height);
 
-    const auto frameDur = std::chrono::milliseconds(1000 / sh.fps);
-    fprintf(stderr, "[main] streaming a %d fps. Ctrl+C para salir.\n", sh.fps);
-
-    uint64_t frames = 0;
-    auto statT = std::chrono::steady_clock::now();
-
+    // Bucle de conexiones: tras un cliente, vuelve a aceptar (soporta reconexion).
     while (g_running) {
-        auto t0 = std::chrono::steady_clock::now();
-        audio.setEnabled(input.audioEnabled());
+        sockaddr_in clientAddr{};
+        ServerHello sh{};
+        if (!doHandshake(outputIndex, wantJpeg, fps, quality, clientAddr, sh)) {
+            if (!g_running) break;
+            continue;                    // reintenta aceptar
+        }
 
-        CapturedFrame f;
-        if (capture.capture(f, (uint32_t)frameDur.count())) {
-            if (f.valid) {
-                bgraToI420Scaled(f.bgra, f.width, f.height, f.rowPitch, cur);
-                capture.endFrame();          // libera el mapeo cuanto antes
-                if (input.isDesktop()) {     // componer el cursor (modo escritorio)
-                    POINT pt;
-                    if (GetCursorPos(&pt)) {
-                        int dw = capture.desktopWidth(), dh = capture.desktopHeight();
-                        if (dw > 0 && dh > 0) {
-                            int sx = (int)((long long)pt.x * cfg.width  / dw);
-                            int sy = (int)((long long)pt.y * cfg.height / dh);
-                            if (sx < 0) sx = 0; else if (sx >= cfg.width)  sx = cfg.width  - 1;
-                            if (sy < 0) sy = 0; else if (sy >= cfg.height) sy = cfg.height - 1;
-                            drawCursorMarker(cur, sx, sy);
+        VideoConfig cfg;
+        cfg.width  = sh.width;  cfg.height = sh.height;
+        cfg.tileW  = sh.tile_w; cfg.tileH  = sh.tile_h;
+        cfg.codec  = sh.codec;  cfg.keyframeInterval = sh.keyframe_interval;
+        cfg.jpegQuality = sh.jpeg_quality;
+        cur.alloc(cfg.width, cfg.height);
+
+        VideoSender sender;
+        if (!sender.init(videoSock, clientAddr, cfg)) continue;
+
+        if (!audioStarted) {
+            sockaddr_in audioDst = clientAddr;
+            audioDst.sin_port = htons(PORT_AUDIO);
+            audio.start(audioDst);
+            audioStarted = true;
+        }
+
+        input.markActive();              // el cliente acaba de conectar
+        auto frameDur = std::chrono::milliseconds(1000 / sh.fps);
+        int  curQuality = sh.jpeg_quality, curFps = sh.fps;
+        uint64_t frames = 0;
+        auto statT = std::chrono::steady_clock::now();
+        fprintf(stderr, "[main] streaming a %d fps.\n", sh.fps);
+
+        // Stream hasta que el cliente deje de mandar input (se fue) o Ctrl+C.
+        // 8s de tolerancia: el teclado en pantalla (swkbd) bloquea el input del
+        // cliente mientras se escribe; no debe contar como desconexion.
+        while (g_running && input.clientActive(8000)) {
+            auto t0 = std::chrono::steady_clock::now();
+            audio.setEnabled(input.audioEnabled());
+
+            int rq = input.qualityReq();
+            if (rq && rq != curQuality) { sender.setQuality(rq); curQuality = rq;
+                fprintf(stderr, "[main] calidad -> %d\n", rq); }
+            int rf = input.fpsReq();
+            if (rf && rf != curFps) { curFps = rf; frameDur = std::chrono::milliseconds(1000 / rf);
+                sender.setKeyframeInterval(rf); fprintf(stderr, "[main] fps -> %d\n", rf); }
+
+            CapturedFrame f;
+            if (capture.capture(f, (uint32_t)frameDur.count())) {
+                if (f.valid) {
+                    bgraToI420Scaled(f.bgra, f.width, f.height, f.rowPitch, cur);
+                    capture.endFrame();
+                    if (input.isDesktop()) {
+                        POINT pt;
+                        if (GetCursorPos(&pt)) {
+                            int dw = capture.desktopWidth(), dh = capture.desktopHeight();
+                            if (dw > 0 && dh > 0) {
+                                int sx = (int)((long long)pt.x * cfg.width  / dw);
+                                int sy = (int)((long long)pt.y * cfg.height / dh);
+                                if (sx < 0) sx = 0; else if (sx >= cfg.width)  sx = cfg.width  - 1;
+                                if (sy < 0) sy = 0; else if (sy >= cfg.height) sy = cfg.height - 1;
+                                drawCursorMarker(cur, sx, sy);
+                            }
                         }
                     }
+                    sender.sendFrame(cur, input.takeKeyframeReq());
+                    ++frames;
                 }
-                sender.sendFrame(cur);
-                ++frames;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-        } else {
-            // Error recuperable (p.ej. ACCESS_LOST): pequena pausa y reintento.
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
 
-        // Pacing a ~fps.
-        auto elapsed = std::chrono::steady_clock::now() - t0;
-        if (elapsed < frameDur) std::this_thread::sleep_for(frameDur - elapsed);
+            auto elapsed = std::chrono::steady_clock::now() - t0;
+            if (elapsed < frameDur) std::this_thread::sleep_for(frameDur - elapsed);
 
-        // Stats cada ~2s.
-        auto now = std::chrono::steady_clock::now();
-        if (now - statT >= std::chrono::seconds(2)) {
-            fprintf(stderr, "[main] %.1f fps enviados\n",
-                    frames / std::chrono::duration<double>(now - statT).count());
-            frames = 0; statT = now;
+            auto now = std::chrono::steady_clock::now();
+            if (now - statT >= std::chrono::seconds(2)) {
+                fprintf(stderr, "[main] %.1f fps enviados\n",
+                        frames / std::chrono::duration<double>(now - statT).count());
+                frames = 0; statT = now;
+            }
         }
+        fprintf(stderr, "[main] cliente inactivo -> esperando nuevo handshake...\n");
     }
 
     fprintf(stderr, "\n[main] cerrando...\n");
