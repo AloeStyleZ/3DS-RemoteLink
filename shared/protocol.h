@@ -68,24 +68,15 @@ enum {
     PKT_VIDEO  = 0x10,   /* fragmento de video  (PC -> 3DS)  */
     PKT_INPUT  = 0x20,   /* estado de input     (3DS -> PC)  */
     PKT_CTRL   = 0x30,   /* control fuera-de-banda por UDP (p.ej. pedir keyframe) */
-    PKT_AUDIO  = 0x40    /* muestras de audio   (PC -> 3DS)  */
+    PKT_AUDIO  = 0x40,   /* muestras de audio   (PC -> 3DS)  */
+    PKT_TEXT   = 0x50    /* texto a teclear     (3DS -> PC)  */
 };
 
 /* --- Codecs del payload de video (campo `codec`) -------------------------- */
 enum {
-    CODEC_RAW_YUV420 = 0,  /* planos Y||U||V crudos del tile (CPU ~0 en 3DS)    */
-    CODEC_JPEG_YCBCR = 1,  /* JPEG del tile, salida en planos YCbCr (sin RGB)   */
-    CODEC_ETC1       = 2   /* bloques ETC1 (4x4 px, 8 bytes) - decode 100% GPU  */
-};
-#define ETC1_BLOCK_BYTES 8   /* bytes de un bloque ETC1 (4x4 px). Compartido    *
-                              * entre el encoder (servidor) y el swizzle        *
-                              * (cliente).                                      */
-
-/* Bits de codec_caps en ClientHello (que codecs sabe decodificar el cliente). */
-enum {
-    CODEC_CAP_RAW  = 1u << 0,
-    CODEC_CAP_JPEG = 1u << 1,
-    CODEC_CAP_ETC1 = 1u << 2
+    CODEC_RAW_YUV420 = 0,  /* planos Y||U||V crudos del tile (CPU ~0 en 3DS)   */
+    CODEC_JPEG_YCBCR = 1,  /* JPEG del tile, salida en planos YCbCr (sin RGB)  */
+    CODEC_RLE_YUV420 = 2   /* RLE por plano (tiles "planos": UI/menus/texto)   */
 };
 
 /* =============================================================================
@@ -170,7 +161,8 @@ enum {
 /* Botones tactiles virtuales (campo vbuttons). */
 enum {
     VBTN_R3     = 1u << 0,   /* (juego)      clic del stick derecho             */
-    VBTN_LCLICK = 1u << 1    /* (escritorio) clic izquierdo del raton           */
+    VBTN_LCLICK = 1u << 1,   /* (escritorio) clic izquierdo del raton (mantenido)*/
+    VBTN_RCLICK = 1u << 2    /* (escritorio) clic derecho del raton              */
 };
 
 /* Subset de mascaras de hidKeysHeld() relevantes (espejo de libctru/hid.h).
@@ -200,7 +192,9 @@ enum {
 enum {
     CTRL_REQUEST_KEYFRAME = 1,
     CTRL_PING             = 2,
-    CTRL_BYE              = 3
+    CTRL_BYE              = 3,
+    CTRL_SET_QUALITY      = 4,   /* arg = calidad JPEG (10..95)  */
+    CTRL_SET_FPS          = 5    /* arg = fps objetivo (10..60)  */
 };
 
 typedef struct {
@@ -228,6 +222,19 @@ typedef struct {
     u16 rate;         /* frecuencia de muestreo (Hz), p.ej. 48000              */
     /* sigue: s16 pcm[samples]                                                 */
 } AudioPacketHeader;  /* sizeof == 8 */
+
+/* === TEXTO (3DS -> PC, UDP puerto input) — teclado en pantalla =============
+ *  El cliente abre swkbd, y envia el texto (UTF-8) para que el PC lo teclee
+ *  via SendInput (eventos de teclado Unicode).
+ * ========================================================================== */
+#define TEXT_MAX 240
+typedef struct {
+    u8  magic;        /* PROTO_MAGIC                  */
+    u8  type;         /* PKT_TEXT                     */
+    u16 seq;          /* secuencia (para ignorar duplicados) */
+    u16 len;          /* bytes UTF-8 que siguen       */
+    /* sigue: char text[len]                          */
+} TextPacketHeader;   /* sizeof == 6 */
 
 /* =============================================================================
  *  HANDSHAKE   (TCP, puerto 7999)
