@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cstring>
 
+bool g_etc1ForceFlatCode = false;
+
 // Tabla de moduladores de intensidad, verificada contra el decoder oficial de
 // Ericsson (compressParams en etcdec.cxx). Las columnas ya estan reordenadas
 // [+chico, +grande, -chico, -grande] para que el indice crudo de 2 bits
@@ -27,14 +29,14 @@ static inline int quant5(int v) { return (v * 31 + 127) / 255; }
 // Expande 5 bits a 8 (replica los 3 bits altos en los bajos): estandar en ETC1.
 static inline int expand5(int v5) { return (v5 << 3) | (v5 >> 2); }
 
-// Posicion (0..15) de un pixel (x,y) dentro del stream de indices de un bloque,
-// segun el orden de iteracion "for x: for y" que usa cada sub-bloque (verificado
-// contra decompressBlockDiffFlipC en etcdec.cxx). Depende de flip porque cambia
-// la forma de las dos mitades (2x4 lado a lado, o 4x2 arriba/abajo).
+// Posicion (0..15) de un pixel (x,y) dentro del stream de indices de un bloque.
+// FIJA, no depende de flip (verificado contra un decoder real de GPU: compute
+// shader ETC1/ETC2 de Granite, etc2.comp -> "linear_pixel = 4*x + y" siempre).
+// Version anterior tenia una formula distinta para flip=1 (mal derivada del
+// C++ de referencia de Ericsson) que mezclaba los pixeles de esos bloques.
 static inline int pixelShift(int x, int y, int flip) {
-    if (!flip) return x * 4 + y;                 // mitades verticales (x<2 / x>=2)
-    const int half = y / 2, y2 = y % 2;           // mitades horizontales (y<2 / y>=2)
-    return half * 8 + x * 2 + y2;
+    (void)flip;
+    return x * 4 + y;
 }
 // A que sub-bloque (0 o 1) pertenece el pixel (x,y).
 static inline int subblockOf(int x, int y, int flip) {
@@ -50,6 +52,16 @@ struct Candidate {
     long long error;
 };
 
+// Evita que los valores que acaban en el "campo G" y el "campo B" (tras el
+// intercambio G<->B, ver empaquetado mas abajo) resulten IDENTICOS. Confirmado
+// empiricamente en HW real: cuando coinciden, aparecen franjas verticales de
+// 1 pixel alternando rojo/cian dentro del bloque (causa exacta en el HW/citro3d
+// desconocida; el ajuste de 1/31 es imperceptible y evita el caso).
+static inline void avoidEqualGB(int& g, int& b) {
+    if (g != b) return;
+    if (b < 31) ++b; else --b;
+}
+
 // Ajusta dr para que r1+dr quede dentro de 0..31 y dr dentro de -4..3.
 static inline int fitDelta(int base5, int desired5) {
     int dr = desired5 - base5;
@@ -63,6 +75,16 @@ static inline int fitDelta(int base5, int desired5) {
 static long long bestTableForSubblock(const uint8_t* rgb, int stride,
                                       int tileOx, int tileOy, int flip, int sub,
                                       const int base8[3], int* outCw, uint8_t outCode[16]) {
+    if (g_etc1ForceFlatCode) {
+        // Diagnostico: mismo modulador (cw=0, code=0) para los 8 pixeles.
+        *outCw = 0;
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 4; ++x)
+                if (subblockOf(x, y, flip) == sub)
+                    outCode[pixelShift(x, y, flip)] = 0;
+        return 0;
+    }
+
     long long bestErr = -1;
     int bestCw = 0;
     uint8_t bestCodes[8];
@@ -124,10 +146,15 @@ static void encodeBlock(const uint8_t* rgb, int stride, int tileOx, int tileOy, 
         const int avg0[3] = { (int)(sum[0][0] / 8), (int)(sum[0][1] / 8), (int)(sum[0][2] / 8) };
         const int avg1[3] = { (int)(sum[1][0] / 8), (int)(sum[1][1] / 8), (int)(sum[1][2] / 8) };
 
-        const int r1 = quant5(avg0[0]), g1 = quant5(avg0[1]), b1 = quant5(avg0[2]);
+        int r1 = quant5(avg0[0]), g1 = quant5(avg0[1]), b1 = quant5(avg0[2]);
+        avoidEqualGB(g1, b1);   // sub-bloque 0
+
+        int g2want = quant5(avg1[1]), b2want = quant5(avg1[2]);
+        avoidEqualGB(g2want, b2want);   // sub-bloque 1 (antes de derivar el delta)
+
         const int dr = fitDelta(r1, quant5(avg1[0]));
-        const int dg = fitDelta(g1, quant5(avg1[1]));
-        const int db = fitDelta(b1, quant5(avg1[2]));
+        const int dg = fitDelta(g1, g2want);
+        const int db = fitDelta(b1, b2want);
 
         const int base0_8[3] = { expand5(r1), expand5(g1), expand5(b1) };
         const int base1_8[3] = { expand5(r1 + dr), expand5(g1 + dg), expand5(b1 + db) };
@@ -150,15 +177,22 @@ static void encodeBlock(const uint8_t* rgb, int stride, int tileOx, int tileOy, 
         }
     }
 
-    // --- Empaquetado (verificado contra etcdec.cxx / GETBITSHIGH) ---------
-    // Palabra alta (bits 63-32): R1'(5)dR(3) G1'(5)dG(3) B1'(5)dB(3) cw1(3)cw2(3) diff(1) flip(1)
+    // --- Empaquetado (verificado contra etcdec.cxx / GETBITSHIGH y contra el
+    // shader de decode real de Granite, bit a bit: R en [31:27], G en [23:19],
+    // B en [15:11] es la especificacion OFICIAL de ETC1). -------------------
+    // OJO: aqui G y B van EN LAS POSICIONES CONTRARIAS a la especificacion,
+    // a proposito. Prueba con patron de colores solidos en HW real: verde puro
+    // salia azul y azul puro salia verde (R se veia bien). Esto indica que el
+    // PICA200 (o citro3d) intercambia G<->B al descomprimir ETC1 -- una
+    // peculiaridad de ESTE hardware, no del formato ETC1 en si (el bitstream
+    // en si esta verificado correcto contra el spec). Se compensa aqui.
     uint32_t high = 0;
     high |= (uint32_t)(best.r1 & 0x1F) << 27;
     high |= (uint32_t)(best.dr & 0x7)  << 24;
-    high |= (uint32_t)(best.g1 & 0x1F) << 19;
-    high |= (uint32_t)(best.dg & 0x7)  << 16;
-    high |= (uint32_t)(best.b1 & 0x1F) << 11;
-    high |= (uint32_t)(best.db & 0x7)  << 8;
+    high |= (uint32_t)(best.b1 & 0x1F) << 19;   // B en la posicion de G
+    high |= (uint32_t)(best.db & 0x7)  << 16;
+    high |= (uint32_t)(best.g1 & 0x1F) << 11;   // G en la posicion de B
+    high |= (uint32_t)(best.dg & 0x7)  << 8;
     high |= (uint32_t)(best.cw[0] & 0x7) << 5;
     high |= (uint32_t)(best.cw[1] & 0x7) << 2;
     high |= 1u << 1;                              // diffbit = 1 (modo diferencial)
@@ -173,10 +207,26 @@ static void encodeBlock(const uint8_t* rgb, int stride, int tileOx, int tileOy, 
         low |= (uint32_t)lsb << n;
     }
 
-    out[0] = (uint8_t)(high >> 24); out[1] = (uint8_t)(high >> 16);
-    out[2] = (uint8_t)(high >> 8);  out[3] = (uint8_t)(high);
-    out[4] = (uint8_t)(low >> 24);  out[5] = (uint8_t)(low >> 16);
-    out[6] = (uint8_t)(low >> 8);   out[7] = (uint8_t)(low);
+    // NOTA: el orden de las dos mitades en memoria es AL REVES de lo que sugiere
+    // la numeracion logica de bits (63..32 / 31..0) de los decoders de software
+    // (p.ej. el de referencia de Ericsson). Verificado contra un decoder real de
+    // GPU (compute shader ETC1/ETC2 de Granite, github.com/Themaister/Granite):
+    // los primeros 4 bytes del bloque llevan los INDICES de pixel (nuestra
+    // palabra 'low'), y los ultimos 4 llevan colores/tablas/diffbit/flipbit
+    // (nuestra palabra 'high'). Antes lo teniamos al reves -> colores corruptos
+    // en hardware real (confirmado por el usuario: "amalgama de pixeles").
+    //
+    // Ademas: 3dbrew (wiki CGFX) dice explicitamente que estos u64 "tradicionalmente
+    // se guardan en big-endian; sin embargo, la implementacion de Nintendo los
+    // guarda en little-endian". O sea: CADA palabra de 32 bits va con el byte
+    // MENOS significativo primero (no el mas significativo como haria un decoder
+    // de software "de libro"). Con esto compensado, sigue habiendo corrupcion en
+    // contenido con variacion por bloque (rampas) aunque colores solidos casi
+    // funcionan -- se prueba este ajuste como siguiente sospechoso concreto.
+    out[0] = (uint8_t)(low);        out[1] = (uint8_t)(low >> 8);
+    out[2] = (uint8_t)(low >> 16);  out[3] = (uint8_t)(low >> 24);
+    out[4] = (uint8_t)(high);       out[5] = (uint8_t)(high >> 8);
+    out[6] = (uint8_t)(high >> 16); out[7] = (uint8_t)(high >> 24);
 }
 
 size_t etc1EncodeTile(const uint8_t* rgb, int tileW, int tileH, uint8_t* out) {

@@ -1,13 +1,17 @@
 #include "video.h"
 #include "protocol.h"
 #include "etc1.h"
+#include <windows.h>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 
 #ifdef HAVE_TURBOJPEG
 #include <turbojpeg.h>
 #endif
+
+int g_udpPaceMs = 0;
 
 VideoSender::~VideoSender() {
 #ifdef HAVE_TURBOJPEG
@@ -48,8 +52,23 @@ bool VideoSender::init(SOCKET sock, const sockaddr_in& dst, const VideoConfig& c
         prevRgb_.alloc(cfg.width, cfg.height);
         const size_t maxEtc1Bytes = (size_t)(cfg.tileW / 4) * (cfg.tileH / 4) * ETC1_BLOCK_BYTES;
         etc1Buf_.resize(maxEtc1Bytes);
+
+        // Primer frame: todos pendientes (equivale al keyframe inicial, pero el
+        // presupuesto por frame lo reparte en vez de enviarlo en una rafaga).
+        pendingEtc1_.assign((size_t)tilesX_ * tilesY_, 1);
+        if (cfg_.fps < 1) cfg_.fps = 1;
+        frameBudget_ = (size_t)cfg_.maxKbps * 1000 / 8 / cfg_.fps;
+        if (frameBudget_ < maxEtc1Bytes) frameBudget_ = maxEtc1Bytes; // minimo 1 tile
     }
     return true;
+}
+
+VideoStats VideoSender::statsFetch() {
+    VideoStats out = stats_;
+    stats_ = VideoStats{};
+    out.backlog = 0;
+    for (uint8_t p : pendingEtc1_) out.backlog += p;
+    return out;
 }
 
 const uint8_t* VideoSender::encodeTile(size_t rawBytes, size_t& outBytes) {
@@ -122,6 +141,7 @@ void VideoSender::sendFrame(const YuvFrame& cur, bool forceKey) {
 
             const int total = (int)sizeof(VideoPktHeader) + (int)len;
             sendto(sock_, (const char*)&pkt, total, 0, (sockaddr*)&dst_, sizeof(dst_));
+            if (g_udpPaceMs > 0) Sleep((DWORD)g_udpPaceMs);
         }
     }
 
@@ -129,22 +149,42 @@ void VideoSender::sendFrame(const YuvFrame& cur, bool forceKey) {
 }
 
 void VideoSender::sendFrameEtc1(const RgbFrame& cur, bool forceKey) {
-    bool keyframe = forceKey;
-    if (++framesSinceKey_ >= cfg_.keyframeInterval) keyframe = true;
+    const int tileCount = tilesX_ * tilesY_;
 
-    computeDirtyTilesRgb(cur, prevRgb_, cfg_.tileW, cfg_.tileH, tilesX_, tilesY_, keyframe, dirtyRgb_);
+    // 1) Marca pendientes: los que cambiaron respecto a lo ULTIMO enviado...
+    computeDirtyTilesRgb(cur, prevRgb_, cfg_.tileW, cfg_.tileH, tilesX_, tilesY_, forceKey, dirtyRgb_);
+    for (int i = 0; i < tileCount; ++i)
+        if (dirtyRgb_[i]) pendingEtc1_[i] = 1;
 
+    // 2) ...mas el refresco rotativo: cada tile se reenvia una vez por
+    // keyframeInterval frames aunque no cambie (recupera tiles perdidos por la
+    // red sin la rafaga de un keyframe completo).
+    const int refresh = (tileCount + cfg_.keyframeInterval - 1) / cfg_.keyframeInterval;
+    for (int k = 0; k < refresh; ++k) {
+        pendingEtc1_[rotRefresh_] = 1;
+        rotRefresh_ = (rotRefresh_ + 1) % tileCount;
+    }
+
+    // 3) Recolecta pendientes en round-robin desde sendCursor_ (sin inanicion).
     std::vector<int> tiles;
-    tiles.reserve(dirtyRgb_.size());
-    for (int i = 0; i < tilesX_ * tilesY_; ++i)
-        if (dirtyRgb_[i]) tiles.push_back(i);
+    tiles.reserve(tileCount);
+    for (int n = 0; n < tileCount; ++n) {
+        const int idx = (sendCursor_ + n) % tileCount;
+        if (pendingEtc1_[idx]) tiles.push_back(idx);
+    }
+    if (tiles.empty()) { prevRgb_ = cur; return; }
+
+    // 4) Presupuesto: cuantos tiles caben este frame (payload ETC1 fijo/tile).
+    const size_t tileBytes = (size_t)(cfg_.tileW / 4) * (cfg_.tileH / 4) * ETC1_BLOCK_BYTES;
+    size_t nSend = frameBudget_ / tileBytes;
+    if (nSend < 1) nSend = 1;
+    if (nSend > tiles.size()) nSend = tiles.size();
 
     const uint16_t fid = frameId_++;
-    if (tiles.empty()) return;
-    if (keyframe) framesSinceKey_ = 0;
+    const auto tEnc0 = std::chrono::steady_clock::now();
 
     VideoPacket pkt;
-    for (size_t ti = 0; ti < tiles.size(); ++ti) {
+    for (size_t ti = 0; ti < nSend; ++ti) {
         const int idx = tiles[ti];
         const int tx = idx % tilesX_, ty = idx / tilesX_;
 
@@ -160,10 +200,10 @@ void VideoSender::sendFrameEtc1(const RgbFrame& cur, bool forceKey) {
             pkt.hdr.magic = PROTO_MAGIC;
             pkt.hdr.type  = PKT_VIDEO;
             pkt.hdr.flags = 0;
-            if (keyframe)                                     pkt.hdr.flags |= VFLAG_KEYFRAME;
-            if (ti == 0 && f == 0)                            pkt.hdr.flags |= VFLAG_FRAME_START;
-            if (ti + 1 == tiles.size() && f + 1 == fragCount) pkt.hdr.flags |= VFLAG_FRAME_END;
-            if (f + 1 == fragCount)                           pkt.hdr.flags |= VFLAG_TILE_LAST;
+            if (forceKey)                              pkt.hdr.flags |= VFLAG_KEYFRAME;
+            if (ti == 0 && f == 0)                     pkt.hdr.flags |= VFLAG_FRAME_START;
+            if (ti + 1 == nSend && f + 1 == fragCount) pkt.hdr.flags |= VFLAG_FRAME_END;
+            if (f + 1 == fragCount)                    pkt.hdr.flags |= VFLAG_TILE_LAST;
             pkt.hdr.codec      = CODEC_ETC1;
             pkt.hdr.frame_id   = fid;
             pkt.hdr.tile_id    = (uint16_t)idx;
@@ -175,8 +215,19 @@ void VideoSender::sendFrameEtc1(const RgbFrame& cur, bool forceKey) {
 
             const int total = (int)sizeof(VideoPktHeader) + (int)len;
             sendto(sock_, (const char*)&pkt, total, 0, (sockaddr*)&dst_, sizeof(dst_));
+            if (g_udpPaceMs > 0) Sleep((DWORD)g_udpPaceMs);
         }
-    }
 
+        pendingEtc1_[idx] = 0;
+        stats_.bytes += payloadBytes;
+        stats_.tiles += 1;
+    }
+    sendCursor_ = (tiles[nSend - 1] + 1) % tileCount;
+
+    stats_.encodeMs += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - tEnc0).count();
+
+    // Referencia = lo ultimo VISTO. Un tile que quedo pendiente no se pierde:
+    // pendingEtc1_ lo mantiene marcado hasta que de verdad se envie.
     prevRgb_ = cur;
 }

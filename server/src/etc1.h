@@ -17,3 +17,9 @@
 // deben ser multiplos de 4. Devuelve el numero de bytes escritos
 // ((tileW/4)*(tileH/4)*8).
 size_t etc1EncodeTile(const uint8_t* rgb, int tileW, int tileH, uint8_t* out);
+
+// Diagnostico: si es true, fuerza cw=0 y codigo=0 (mismo modulador) en TODOS
+// los pixeles de TODOS los bloques, saltandose la busqueda normal. Sirve para
+// aislar si un artefacto (p.ej. franjas verticales en tiles solidos) depende
+// de que distintos pixeles usen distintos codigos, o pasa igual con codigo fijo.
+extern bool g_etc1ForceFlatCode;

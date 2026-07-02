@@ -42,7 +42,7 @@ static void stream_loop(const ServerHello* sh) {
     const u32 fpsBg   = C2D_Color32(0x00, 0x00, 0x00, 0xB0);
 
     C2D_TextBuf textBuf = C2D_TextBufNew(1024);
-    C2D_TextBuf dynBuf  = C2D_TextBufNew(64);   // texto dinamico (FPS)
+    C2D_TextBuf dynBuf  = C2D_TextBufNew(128);   // texto dinamico (FPS + decode ms)
     C2D_Text tMenu, tConfig, tExit, tBack, tModeGame, tModeDesk, tFpsOn, tFpsOff, tTrack, tTrackHint, tHint;
     C2D_TextParse(&tMenu,      textBuf, "MENU");
     C2D_TextParse(&tConfig,    textBuf, "Configurar");
@@ -86,6 +86,10 @@ static void stream_loop(const ServerHello* sh) {
     // Contador de FPS de video (frames presentados por segundo).
     u64  fpsT = osGetTime();
     int  presentCount = 0, videoFps = 0;
+    // Cronometro de precision (ticks de CPU) del coste real de decodificar+
+    // presentar un frame. Con JPEG mide IDCT+Huffman+Y2R; con ETC1 mide poco
+    // mas que el memcpy de los bloques (la GPU hace el resto sola al dibujar).
+    double decMs = 0.0;
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -187,8 +191,14 @@ static void stream_loop(const ServerHello* sh) {
         }
 
         // ----- Video entrante -----
+        u64 tickA = svcGetSystemTick();
         net_drain_video(&dec);
-        if (video_update(&dec)) presentCount++;
+        bool presented = video_update(&dec);
+        u64 tickB = svcGetSystemTick();
+        if (presented) {
+            presentCount++;
+            decMs = (double)(tickB - tickA) * 1000.0 / SYSCLOCK_ARM11;
+        }
 
         u64 nowt = osGetTime();
         if (nowt - fpsT >= 1000) { videoFps = presentCount; presentCount = 0; fpsT = nowt; }
@@ -199,10 +209,10 @@ static void stream_loop(const ServerHello* sh) {
         C2D_SceneBegin(top);
         video_draw(&dec, 0.0f, 0.0f);
         if (fpsOn) {
-            char s[24]; snprintf(s, sizeof(s), "FPS: %d", videoFps);
+            char s[40]; snprintf(s, sizeof(s), "FPS: %d   decode: %.2fms", videoFps, decMs);
             C2D_Text t; C2D_TextBufClear(dynBuf);
             C2D_TextParse(&t, dynBuf, s); C2D_TextOptimize(&t);
-            C2D_DrawRectSolid(2, 2, 0, 64, 18, fpsBg);
+            C2D_DrawRectSolid(2, 2, 0, 160, 18, fpsBg);
             C2D_DrawText(&t, C2D_WithColor, 6, 3, 0, 0.5f, 0.5f, fpsClr);
         }
 

@@ -131,6 +131,12 @@ static void unpack_tile_raw(VideoDecoder* d, int tx, int ty, const u8* blob) {
 // (que para una rejilla 2x2 coincide con Z-order). Verificado contra el loop
 // de encode.cpp de tex3ds (source/encode.cpp, funcion etc1_common) y contra el
 // mismo patron "fila de tiles + hueco" que ya usa Y2R en video_present().
+//
+// Se habia descartado esta formula durante el debugging porque el HW seguia
+// mostrando corrupcion, pero esa corrupcion en realidad venia del orden de
+// bytes (big-endian vs little-endian) dentro de cada palabra ETC1, ya
+// corregido en el servidor (etc1.cpp). Con el color ya resuelto, se restaura
+// el swizzle Morton original para corregir la duplicacion en "islas".
 static inline u32 etc1BlockOffset(int bx, int by, int potBlocksPerRow) {
     const int superX = bx >> 1, superY = by >> 1;
     const int wx = bx & 1, wy = by & 1;

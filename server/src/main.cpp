@@ -13,9 +13,11 @@
 #include "video.h"
 #include "input.h"
 #include "audio.h"
+#include "etc1.h"
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -52,7 +54,7 @@ static bool sendAll(SOCKET s, const void* buf, int n) {
 // Bloquea hasta que un 3DS conecta y completa el handshake.
 // Rellena clientAddr (IP del 3DS) y el ServerHello acordado.
 static bool doHandshake(int outputIndex, bool wantJpeg, bool wantEtc1, int fps, int quality,
-                        sockaddr_in& clientAddr, ServerHello& sh) {
+                        sockaddr_in& clientAddr, ServerHello& sh, uint32_t& clientMaxKbps) {
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (ls == INVALID_SOCKET) return false;
     int yes = 1;
@@ -84,9 +86,10 @@ static bool doHandshake(int outputIndex, bool wantJpeg, bool wantEtc1, int fps, 
         closesocket(cs);
         return false;
     }
-    fprintf(stderr, "[hs] 3DS %s pide %ux%u caps=0x%X video_port=%u input_port=%u\n",
+    fprintf(stderr, "[hs] 3DS %s pide %ux%u caps=0x%X video_port=%u input_port=%u max_kbps=%u\n",
             ipstr, ch.want_width, ch.want_height, ch.codec_caps,
-            ch.udp_video_port, ch.udp_input_port);
+            ch.udp_video_port, ch.udp_input_port, ch.max_kbps);
+    clientMaxKbps = ch.max_kbps;
 
     // Negociacion: resolucion del cliente si es valida, si no defaults.
     int w = ch.want_width, h = ch.want_height;
@@ -197,18 +200,122 @@ static void drawCursorMarkerRgb(RgbFrame& f, int cx, int cy) {
     }
 }
 
+// Convierte HSV (h en 0..359, s,v en 0..255) a RGB. Estandar.
+static void hsv2rgb(int h, int s, int v, uint8_t out[3]) {
+    float S = s / 255.0f, V = v / 255.0f;
+    float C = V * S;
+    float X = C * (1 - fabsf(fmodf(h / 60.0f, 2.0f) - 1));
+    float m = V - C;
+    float r=0,g=0,b=0;
+    if      (h < 60)  { r=C; g=X; b=0; }
+    else if (h < 120) { r=X; g=C; b=0; }
+    else if (h < 180) { r=0; g=C; b=X; }
+    else if (h < 240) { r=0; g=X; b=C; }
+    else if (h < 300) { r=X; g=0; b=C; }
+    else              { r=C; g=0; b=X; }
+    out[0] = (uint8_t)((r+m)*255); out[1] = (uint8_t)((g+m)*255); out[2] = (uint8_t)((b+m)*255);
+}
+
+// Arcoiris CONTINUO por toda la pantalla (matiz horizontal, brillo vertical):
+// cubre todo el espacio de color de una sola vez, mucho mas exhaustivo que una
+// paleta de 12 colores. Cualquier valor problematico (como el caso G==B ya
+// encontrado) deberia verse como un artefacto puntual sobre un fondo suave.
+static void fillRainbowPattern(RgbFrame& f) {
+    for (int y = 0; y < f.h; ++y) {
+        const int v = 80 + (y * 175) / (f.h - 1);   // brillo: oscuro arriba, claro abajo
+        uint8_t* row = f.rgb.data() + (size_t)y * f.stride();
+        for (int x = 0; x < f.w; ++x) {
+            const int hue = (x * 360) / f.w;
+            uint8_t c[3];
+            hsv2rgb(hue, 255, v, c);
+            row[x*3+0]=c[0]; row[x*3+1]=c[1]; row[x*3+2]=c[2];
+        }
+    }
+}
+
+// Barrido puro de un canal (R, G o B) de 0 a 255 a lo ancho de toda la pantalla,
+// los otros dos canales fijos en 0. Sirve de "osciloscopio": cualquier valor
+// concreto que falle se vera como un artefacto puntual sobre una rampa lisa,
+// mucho mas facil de leer que unos pocos tiles sueltos.
+static void fillChannelRamp(RgbFrame& f, int channel, int tileW) {
+    // Si tileW>0, la rampa completa cabe en UN solo tile (0..tileW-1) y el
+    // resto de la pantalla queda a 0 (negro) -> aisla si el artefacto aparece
+    // DENTRO de un tile (bug de bloques/fragmentos) o solo ENTRE tiles (bug de
+    // direccionamiento entre tiles).
+    const int rampW = (tileW > 0) ? tileW : f.w;
+    for (int y = 0; y < f.h; ++y) {
+        uint8_t* row = f.rgb.data() + (size_t)y * f.stride();
+        for (int x = 0; x < f.w; ++x) {
+            uint8_t v = 0;
+            if (x < rampW) v = (uint8_t)((x * 255) / (rampW - 1));
+            row[x*3+0] = (channel == 0) ? v : 0;
+            row[x*3+1] = (channel == 1) ? v : 0;
+            row[x*3+2] = (channel == 2) ? v : 0;
+        }
+    }
+}
+
+// Patron de diagnostico. Modo 0 (colores solidos): un color plano por tile de
+// red, util para ver si el swizzle coloca cada tile en su sitio. Modo 1
+// (degradado): cada tile pasa de un color a otro a lo ancho -> OBLIGA a que
+// casi todos los bloques 4x4 usen un delta (dr/dg/db) REAL, no cero. Los
+// colores solidos (delta=0 siempre) no probaban esta ruta -> es sospechosa de
+// ser la causa de que el contenido real (fotos/degradados/bordes) siga
+// saliendo muy mal aunque los colores solidos ya funcionan.
+static void fillTestPattern(RgbFrame& f, int tilesX, int tilesY, int tileW, int tileH, bool gradient) {
+    static const uint8_t palette[][3] = {
+        {255,0,0},   {192,0,0},   {128,0,0},   {64,0,0},
+        {255,255,255}, {255,0,255}, {255,255,0}, {0,255,0},
+        {0,0,255},   {0,255,255}, {128,128,128}, {200,50,50}
+    };
+    const int nColors = (int)(sizeof(palette) / sizeof(palette[0]));
+    for (int ty = 0; ty < tilesY; ++ty) {
+        for (int tx = 0; tx < tilesX; ++tx) {
+            const uint8_t* c0 = palette[(ty * tilesX + tx) % nColors];
+            const uint8_t* c1 = palette[(ty * tilesX + tx + 1) % nColors];
+            for (int y = 0; y < tileH; ++y) {
+                uint8_t* row = f.rgb.data() + (size_t)(ty * tileH + y) * f.stride() + (size_t)(tx * tileW) * 3;
+                for (int x = 0; x < tileW; ++x) {
+                    if (gradient) {
+                        const int t = (x * 255) / (tileW - 1);   // 0..255 a lo ancho del tile
+                        row[x*3+0] = (uint8_t)(c0[0] + ((c1[0]-c0[0]) * t) / 255);
+                        row[x*3+1] = (uint8_t)(c0[1] + ((c1[1]-c0[1]) * t) / 255);
+                        row[x*3+2] = (uint8_t)(c0[2] + ((c1[2]-c0[2]) * t) / 255);
+                    } else {
+                        row[x*3+0] = c0[0]; row[x*3+1] = c0[1]; row[x*3+2] = c0[2];
+                    }
+                }
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     int  outputIndex = 0;
     bool wantJpeg = false;
     bool wantEtc1 = false;
+    bool testPattern = false;
+    bool testGradient = false;
+    bool testRainbow = false;
+    int  testRamp = -1;   // -1=off, 0=R, 1=G, 2=B
+    bool rampOneTile = false;
     int  fps = 30;
     int  quality = 55;
+    int  maxKbps = 0;     // 0 = usar el max_kbps que anuncia el cliente
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--jpeg")) wantJpeg = true;
         else if (!strcmp(argv[i], "--etc1")) wantEtc1 = true;
+        else if (!strcmp(argv[i], "--testpattern")) testPattern = true;
+        else if (!strcmp(argv[i], "--testgradient")) { testPattern = true; testGradient = true; }
+        else if (!strcmp(argv[i], "--testrainbow")) { testPattern = true; testRainbow = true; }
+        else if (!strcmp(argv[i], "--testramp") && i + 1 < argc) { testPattern = true; testRamp = atoi(argv[++i]); }
+        else if (!strcmp(argv[i], "--ramponetile")) rampOneTile = true;
+        else if (!strcmp(argv[i], "--udppace") && i + 1 < argc) g_udpPaceMs = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--etc1flatcode")) g_etc1ForceFlatCode = true; // diagnostico
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) outputIndex = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--quality") && i + 1 < argc) quality = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--maxkbps") && i + 1 < argc) maxKbps = atoi(argv[++i]);
     }
     if (fps < 5)  fps = 5;
     if (fps > 60) fps = 60;
@@ -221,7 +328,8 @@ int main(int argc, char** argv) {
 
     sockaddr_in clientAddr{};
     ServerHello sh{};
-    if (!doHandshake(outputIndex, wantJpeg, wantEtc1, fps, quality, clientAddr, sh)) { WSACleanup(); return 1; }
+    uint32_t clientMaxKbps = 0;
+    if (!doHandshake(outputIndex, wantJpeg, wantEtc1, fps, quality, clientAddr, sh, clientMaxKbps)) { WSACleanup(); return 1; }
 
     // Socket UDP de video (solo envio).
     SOCKET videoSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -232,6 +340,11 @@ int main(int argc, char** argv) {
     cfg.tileW  = sh.tile_w; cfg.tileH  = sh.tile_h;
     cfg.codec  = sh.codec;  cfg.keyframeInterval = sh.keyframe_interval;
     cfg.jpegQuality = sh.jpeg_quality;
+    cfg.fps = sh.fps;
+    // Prioridad: --maxkbps > lo que anuncia el cliente > default de VideoConfig.
+    if (maxKbps > 0)            cfg.maxKbps = maxKbps;
+    else if (clientMaxKbps > 0) cfg.maxKbps = (int)clientMaxKbps;
+    fprintf(stderr, "[main] presupuesto de envio: %d kbps\n", cfg.maxKbps);
 
     VideoSender sender;
     if (!sender.init(videoSock, clientAddr, cfg)) { closesocket(videoSock); WSACleanup(); return 1; }
@@ -285,7 +398,10 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (etc1Mode) {
-                    bgraToRgbScaled(f.bgra, f.width, f.height, f.rowPitch, curRgb);
+                    if (testRamp >= 0) fillChannelRamp(curRgb, testRamp, rampOneTile ? cfg.tileW : -1);
+                    else if (testRainbow) fillRainbowPattern(curRgb);
+                    else if (testPattern) fillTestPattern(curRgb, sender.tilesX(), sender.tilesY(), cfg.tileW, cfg.tileH, testGradient);
+                    else bgraToRgbScaled(f.bgra, f.width, f.height, f.rowPitch, curRgb);
                     capture.endFrame();
                     if (sx >= 0) drawCursorMarkerRgb(curRgb, sx, sy);
                     sender.sendFrameEtc1(curRgb);
@@ -309,8 +425,18 @@ int main(int argc, char** argv) {
         // Stats cada ~2s.
         auto now = std::chrono::steady_clock::now();
         if (now - statT >= std::chrono::seconds(2)) {
-            fprintf(stderr, "[main] %.1f fps enviados\n",
-                    frames / std::chrono::duration<double>(now - statT).count());
+            const double secs = std::chrono::duration<double>(now - statT).count();
+            if (etc1Mode) {
+                VideoStats vs = sender.statsFetch();
+                fprintf(stderr, "[main] %.1f fps | %.1f tiles/f | %.0f KB/s | enc %.1f ms/f | backlog %d\n",
+                        frames / secs,
+                        frames ? (double)vs.tiles / frames : 0.0,
+                        vs.bytes / 1024.0 / secs,
+                        frames ? vs.encodeMs / frames : 0.0,
+                        vs.backlog);
+            } else {
+                fprintf(stderr, "[main] %.1f fps enviados\n", frames / secs);
+            }
             frames = 0; statT = now;
         }
     }
