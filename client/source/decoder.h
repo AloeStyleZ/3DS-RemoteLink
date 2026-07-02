@@ -21,28 +21,33 @@ typedef struct VideoDecoder {
     int width, height;
     int tileW, tileH, tilesX, tilesY, tileCount;
     int maxTileBytes;
+    u8  codec;        // CODEC_RAW_YUV420 / CODEC_JPEG_YCBCR / CODEC_ETC1
 
     // Planos I420 persistentes en memoria lineal (delta frames aplicados aqui).
+    // NO se usan en modo ETC1 (queda sin asignar: y=u=v=NULL).
     u8 *y, *u, *v;
     size_t ySize, cSize;
 
     TileReasm* reasm;
     u8*        rleScratch;   // buffer temporal para expandir RLE -> blob raw (maxTileBytes)
 
-    // Salida: textura POT RGB565 envuelta como C2D_Image.
+    // Salida: textura POT (RGB565 via Y2R, o ETC1 directo) envuelta en C2D_Image.
     C3D_Tex           tex;
     Tex3DS_SubTexture subtex;
     C2D_Image         img;
 
+    // Geometria de bloques ETC1 (solo si codec == CODEC_ETC1).
+    int blocksPerTileRow, blocksPerTileCol, potBlocksPerRow;
+
     Handle y2rEvent;
     bool   ready;          // hay al menos un frame valido en la textura
-    bool   pendingPresent; // llego un FRAME_END; falta hacer Y2R+present
+    bool   pendingPresent; // llego un FRAME_END; falta presentar (Y2R o flush)
     void*  tjDec;          // tjhandle de decompresion JPEG (turbojpeg)
     volatile u32 framesPresented; // contador de frames presentados (para FPS entre hilos)
     volatile u32 droppedTiles;    // tiles que quedaron incompletos (perdida -> pedir keyframe)
 } VideoDecoder;
 
-bool video_init(VideoDecoder* d, int w, int h, int tileW, int tileH);
+bool video_init(VideoDecoder* d, int w, int h, int tileW, int tileH, u8 codec);
 void video_exit(VideoDecoder* d);
 
 // Procesa un datagrama de video (cabecera+payload). Devuelve true si el paquete

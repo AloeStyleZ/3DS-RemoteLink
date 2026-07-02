@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:registry.khronos.org)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:github.com)",
+      "PowerShell(& \"C:\\\\devkitPro\\\\msys2\\\\usr\\\\bin\\\\bash.exe\" -lc \"cd /d/Proyectos/3DSStreaming/client && make clean >/dev/null 2>&1 && make 2>&1 | tail -40\")"
+    ]
+  }
+}

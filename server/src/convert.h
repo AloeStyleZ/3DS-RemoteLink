@@ -36,3 +36,30 @@ void computeDirtyTiles(const YuvFrame& cur, const YuvFrame& prev,
 // Devuelve el numero de bytes escritos.
 size_t extractTile(const YuvFrame& f, int tx, int ty, int tileW, int tileH,
                    std::vector<uint8_t>& out);
+
+// --- Pipeline RGB888 (para el codec ETC1: sin YUV, el color no pierde nada) ---
+
+// Frame RGB888 interleaved (R,G,B por pixel). Sin submuestreo de color.
+struct RgbFrame {
+    int w = 0, h = 0;
+    std::vector<uint8_t> rgb; // w*h*3
+
+    void alloc(int width, int height) {
+        w = width; h = height;
+        rgb.assign((size_t)w * h * 3, 0);
+    }
+    int stride() const { return w * 3; }
+};
+
+// Escala BGRA (srcW x srcH, srcPitch bytes/fila) -> dst.w x dst.h en RGB888.
+void bgraToRgbScaled(const uint8_t* bgra, int srcW, int srcH, int srcPitch, RgbFrame& dst);
+
+// Marca en `dirty` los tiles que difieren entre cur y prev (mismo criterio que
+// computeDirtyTiles, pero sobre un frame RGB entrelazado en vez de YUV planar).
+void computeDirtyTilesRgb(const RgbFrame& cur, const RgbFrame& prev,
+                          int tileW, int tileH, int tilesX, int tilesY,
+                          bool keyframe, std::vector<uint8_t>& dirty);
+
+// Extrae el tile (tx,ty) de f en RGB888 contiguo (fila a fila) en `out`.
+size_t extractTileRgb(const RgbFrame& f, int tx, int ty, int tileW, int tileH,
+                      std::vector<uint8_t>& out);

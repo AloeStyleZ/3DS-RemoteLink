@@ -14,6 +14,7 @@ add_executable(server
     src/capture.cpp
     src/convert.cpp
     src/video.cpp
+    src/etc1.cpp
     src/input.cpp
     src/audio.cpp)
 

@@ -248,7 +248,7 @@ typedef struct {
     u8  version;          /* PROTO_VERSION                                     */
     u16 want_width;       /* resolucion deseada (p.ej. 400)                    */
     u16 want_height;      /* (p.ej. 240)                                       */
-    u16 codec_caps;       /* bitmask: bit0=RAW_YUV420, bit1=JPEG               */
+    u16 codec_caps;       /* bitmask CODEC_CAP_* (que codecs decodifica el cliente) */
     u16 udp_video_port;   /* puerto donde el 3DS escuchara video (8000)        */
     u16 udp_input_port;   /* puerto desde el que el 3DS enviara input (8001)   */
     u32 max_kbps;         /* techo de ancho de banda que el cliente acepta     */
