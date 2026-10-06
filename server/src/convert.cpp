@@ -118,16 +118,40 @@ size_t extractTile(const YuvFrame& f, int tx, int ty, int tileW, int tileH,
 
 void bgraToRgbScaled(const uint8_t* src, int sw, int sh, int sp, RgbFrame& d) {
     const int dw = d.w, dh = d.h;
-    std::vector<int> xmap(dw);
-    for (int x = 0; x < dw; ++x) xmap[x] = ((x * sw) / dw) * 4;
+
+    // Promedio de AREA (box filter): cada pixel destino = media de TODO su
+    // bloque fuente (~6x4 pixeles al bajar 1920x1080 -> 320x240). El vecino-
+    // mas-cercano anterior tomaba 1 muestra y descartaba ~96% de la imagen:
+    // texto roto, bordes dentados y "shimmering" al moverse. El coste extra es
+    // solo del lado PC (unos ms); para la 3DS es identico. Ademas la imagen
+    // suavizada dispara menos tiles sucios y ETC1 la comprime con menos error.
+    //
+    // Bordes de cada bloque precalculados (enteros, sin division por pixel).
+    std::vector<int> xEdge(dw + 1), yEdge(dh + 1);
+    for (int x = 0; x <= dw; ++x) xEdge[x] = (int)((int64_t)x * sw / dw);
+    for (int y = 0; y <= dh; ++y) yEdge[y] = (int)((int64_t)y * sh / dh);
 
     for (int y = 0; y < dh; ++y) {
-        const uint8_t* srow = src + (size_t)((y * sh) / dh) * sp;
+        const int sy0 = yEdge[y];
+        const int sy1 = (yEdge[y + 1] > sy0) ? yEdge[y + 1] : sy0 + 1;
         uint8_t* drow = d.rgb.data() + (size_t)y * d.stride();
+
         for (int x = 0; x < dw; ++x) {
-            const uint8_t* p = srow + xmap[x]; // B,G,R,A
+            const int sx0 = xEdge[x];
+            const int sx1 = (xEdge[x + 1] > sx0) ? xEdge[x + 1] : sx0 + 1;
+
+            unsigned sumR = 0, sumG = 0, sumB = 0;
+            for (int yy = sy0; yy < sy1; ++yy) {
+                const uint8_t* p = src + (size_t)yy * sp + (size_t)sx0 * 4; // B,G,R,A
+                for (int xx = sx0; xx < sx1; ++xx, p += 4) {
+                    sumB += p[0]; sumG += p[1]; sumR += p[2];
+                }
+            }
+            const unsigned n = (unsigned)((sx1 - sx0) * (sy1 - sy0));
             uint8_t* q = drow + x * 3;
-            q[0] = p[2]; q[1] = p[1]; q[2] = p[0]; // R,G,B
+            q[0] = (uint8_t)(sumR / n);
+            q[1] = (uint8_t)(sumG / n);
+            q[2] = (uint8_t)(sumB / n);
         }
     }
 }

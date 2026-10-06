@@ -27,6 +27,13 @@ bool audio_init(void) {
 
     for (int i = 0; i < AUDIO_NUM_WBUF; ++i) {
         s_data[i] = (s16*)linearAlloc(AUDIO_WBUF_SAMPLES * sizeof(s16));
+        if (!s_data[i]) {
+            // Sin memoria lineal: liberar lo asignado y salir SIN marcar ready
+            // (si no, audio_feed haria memcpy a NULL -> crash).
+            for (int j = 0; j < i; ++j) { linearFree(s_data[j]); s_data[j] = NULL; }
+            ndspExit();
+            return false;
+        }
         memset(&s_wbuf[i], 0, sizeof(s_wbuf[i]));   // status = NDSP_WBUF_FREE
         s_wbuf[i].data_vaddr = s_data[i];
     }
@@ -36,8 +43,12 @@ bool audio_init(void) {
 }
 
 void audio_feed(const s16* pcm, int samples, u32 rate) {
-    if (!s_ready || samples <= 0) return;
-    if (rate && rate != s_rate) { ndspChnSetRate(0, (float)rate); s_rate = rate; }
+    if (!s_ready || !pcm || samples <= 0) return;
+    // Solo tasas sanas (un paquete corrupto no debe tocar el canal NDSP).
+    if (rate >= 8000 && rate <= 48000 && rate != s_rate) {
+        ndspChnSetRate(0, (float)rate);
+        s_rate = rate;
+    }
 
     ndspWaveBuf* wb = &s_wbuf[s_idx];
     // Solo reusar un buffer libre o ya reproducido (si no, lo descartamos).

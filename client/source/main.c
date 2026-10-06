@@ -13,6 +13,7 @@
 #include "net.h"
 #include "decoder.h"
 #include "appconfig.h"
+#include "audio.h"
 
 enum { ST_STREAM, ST_MENU, ST_CONFIG };
 enum { SL_QUIT, SL_DISCONNECT };
@@ -21,7 +22,7 @@ enum { SL_QUIT, SL_DISCONNECT };
 #define TAP_MAX_FRAMES 12
 #define TAP_MAX_MOVE   10
 #define DOUBLE_TAP_MS  350
-#define CFG_ROWS       9
+#define CFG_ROWS       10
 #define RX_TIMEOUT_MS  4000
 
 typedef struct {
@@ -91,7 +92,7 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
     // Etiquetas (en el textBuf persistente, que limpiamos primero).
     C2D_TextBufClear(ui->textBuf);
     C2D_Text tKbd, tConfig, tExit, tBack, tModeGame, tModeDesk, tBtnName, tBtnPos,
-             tHudOn, tHudOff, tIP, tLClick, tRClick, tTrack, tTrackHint, tHint;
+             tHudOn, tHudOff, tAudOn, tAudOff, tIP, tLClick, tRClick, tTrack, tTrackHint, tHint;
     C2D_TextParse(&tKbd,       ui->textBuf, "Teclado");
     C2D_TextParse(&tConfig,    ui->textBuf, "Configurar");
     C2D_TextParse(&tExit,      ui->textBuf, "Salir");
@@ -102,6 +103,8 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
     C2D_TextParse(&tBtnPos,    ui->textBuf, "Botones: Posicion");
     C2D_TextParse(&tHudOn,     ui->textBuf, "FPS HUD: ON");
     C2D_TextParse(&tHudOff,    ui->textBuf, "FPS HUD: OFF");
+    C2D_TextParse(&tAudOn,     ui->textBuf, "Audio: ON");
+    C2D_TextParse(&tAudOff,    ui->textBuf, "Audio: OFF");
     C2D_TextParse(&tIP,        ui->textBuf, "Cambiar IP...");
     C2D_TextParse(&tLClick,    ui->textBuf, "Clic Izq");
     C2D_TextParse(&tRClick,    ui->textBuf, "Clic Der");
@@ -109,11 +112,12 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
     C2D_TextParse(&tTrackHint, ui->textBuf, "Arrastra: mover  /  toca: clic izq");
     C2D_TextParse(&tHint,      ui->textBuf, "START+SELECT: volver al juego");
     C2D_Text* all[] = { &tKbd,&tConfig,&tExit,&tBack,&tModeGame,&tModeDesk,&tBtnName,
-                        &tBtnPos,&tHudOn,&tHudOff,&tIP,&tLClick,&tRClick,&tTrack,&tTrackHint,&tHint };
+                        &tBtnPos,&tHudOn,&tHudOff,&tAudOn,&tAudOff,&tIP,&tLClick,&tRClick,
+                        &tTrack,&tTrackHint,&tHint };
     for (unsigned i = 0; i < sizeof(all)/sizeof(all[0]); ++i) C2D_TextOptimize(all[i]);
 
     VideoDecoder dec;
-    if (!video_init(&dec, sh->width, sh->height, sh->tile_w, sh->tile_h))
+    if (!video_init(&dec, sh->width, sh->height, sh->tile_w, sh->tile_h, sh->codec))
         return SL_DISCONNECT;
 
     net_send_ctrl(CTRL_SET_QUALITY, (u32)cfg->quality);
@@ -121,7 +125,7 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
     net_send_ctrl(CTRL_REQUEST_KEYFRAME, 0);
 
     const float MX = 50, MW = 220, MH = 44, MY0 = 55, MSTEP = 52;
-    const float RX = 40, RW = 240, RH = 21, RY0 = 26, RSTEP = 23;
+    const float RX = 40, RW = 240, RH = 19, RY0 = 22, RSTEP = 21;
     const float BTNY = 198, BTNH = 36;
     const float LBX = 10,  LBW = 145;   // boton Clic Izq
     const float RBX = 165, RBW = 145;   // boton Clic Der
@@ -218,12 +222,14 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
             InputPacket ip;
             ip.magic = PROTO_MAGIC; ip.type = PKT_INPUT; ip.seq = inputSeq++;
             ip.buttons = b; ip.circle_x = (s16)ax; ip.circle_y = (s16)ay;
-            ip.right_x = rx; ip.right_y = ry; ip.vbuttons = vb; ip.mode = (u8)cfg->inputMode;
+            ip.right_x = rx; ip.right_y = ry; ip.vbuttons = vb;
+            ip.mode = (u8)cfg->inputMode | (cfg->audioOn ? INPUT_FLAG_AUDIO : 0);
             net_send_input(&ip);
         } else {
             engaged = 0; touchActive = false; lclickFrames = 0;
             InputPacket ip; memset(&ip, 0, sizeof(ip));
-            ip.magic = PROTO_MAGIC; ip.type = PKT_INPUT; ip.seq = inputSeq++; ip.mode = (u8)cfg->inputMode;
+            ip.magic = PROTO_MAGIC; ip.type = PKT_INPUT; ip.seq = inputSeq++;
+            ip.mode = (u8)cfg->inputMode | (cfg->audioOn ? INPUT_FLAG_AUDIO : 0);
             net_send_input(&ip);
 
             if (state == ST_MENU) {
@@ -258,11 +264,12 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
                     case 0: if (dir || act) cfg->inputMode = (cfg->inputMode == INPUT_MODE_GAME) ? INPUT_MODE_DESKTOP : INPUT_MODE_GAME; break;
                     case 1: if (dir || act) cfg->buttonSwap = !cfg->buttonSwap; break;
                     case 2: if (dir || act) cfg->fpsHud = !cfg->fpsHud; break;
-                    case 3: if (dir) { cfg->quality = clampi(cfg->quality + dir*5, 10, 95); net_send_ctrl(CTRL_SET_QUALITY, (u32)cfg->quality); } break;
-                    case 4: if (dir) { cfg->fps = clampi(cfg->fps + dir*5, 10, 60); net_send_ctrl(CTRL_SET_FPS, (u32)cfg->fps); } break;
-                    case 5: if (dir) cfg->sensPercent = clampi(cfg->sensPercent + dir*10, 50, 200); break;
-                    case 6: if (dir) cfg->deadzone = clampi(cfg->deadzone + dir*2, 0, 40); break;
-                    case 7: if (act) {
+                    case 3: if (dir || act) cfg->audioOn = !cfg->audioOn; break;
+                    case 4: if (dir) { cfg->quality = clampi(cfg->quality + dir*5, 10, 95); net_send_ctrl(CTRL_SET_QUALITY, (u32)cfg->quality); } break;
+                    case 5: if (dir) { cfg->fps = clampi(cfg->fps + dir*5, 10, 60); net_send_ctrl(CTRL_SET_FPS, (u32)cfg->fps); } break;
+                    case 6: if (dir) cfg->sensPercent = clampi(cfg->sensPercent + dir*10, 50, 200); break;
+                    case 7: if (dir) cfg->deadzone = clampi(cfg->deadzone + dir*2, 0, 40); break;
+                    case 8: if (act) {
                                 char ipbuf[64];
                                 if (swkbd_get(ipbuf, sizeof(ipbuf), "IP del servidor", cfg->serverIp)) {
                                     strncpy(cfg->serverIp, ipbuf, sizeof(cfg->serverIp) - 1);
@@ -270,13 +277,14 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
                                     result = SL_DISCONNECT; goto leave;
                                 }
                             } break;
-                    case 8: if (act) state = ST_MENU; break;
+                    case 9: if (act) state = ST_MENU; break;
                 }
                 if (kDown & KEY_B) state = ST_MENU;
             }
         }
 
         if (net_drain_video(&dec)) lastRx = osGetTime();
+        if (cfg->audioOn) net_drain_audio();
         video_update(&dec);
 
         u64 now = osGetTime();
@@ -334,6 +342,7 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
             C2D_DrawText(cfg->inputMode == INPUT_MODE_GAME ? &tModeGame : &tModeDesk, C2D_WithColor | C2D_AlignCenter, cx, ROWY(0), 0, 0.45f, 0.45f, white);
             C2D_DrawText(cfg->buttonSwap ? &tBtnPos : &tBtnName, C2D_WithColor | C2D_AlignCenter, cx, ROWY(1), 0, 0.45f, 0.45f, white);
             C2D_DrawText(cfg->fpsHud ? &tHudOn : &tHudOff, C2D_WithColor | C2D_AlignCenter, cx, ROWY(2), 0, 0.45f, 0.45f, white);
+            C2D_DrawText(cfg->audioOn ? &tAudOn : &tAudOff, C2D_WithColor | C2D_AlignCenter, cx, ROWY(3), 0, 0.45f, 0.45f, white);
             char b3[24], b4[24], b5[24], b6[24], b7[80];
             snprintf(b3, sizeof(b3), "Calidad: %d", cfg->quality);
             snprintf(b4, sizeof(b4), "FPS: %d", cfg->fps);
@@ -343,9 +352,9 @@ static int stream_loop(Ui* ui, AppConfig* cfg, const ServerHello* sh) {
             const char* dyn[5] = { b3, b4, b5, b6, b7 };
             for (int i = 0; i < 5; ++i) {
                 C2D_Text t; C2D_TextParse(&t, dynBuf, dyn[i]); C2D_TextOptimize(&t);
-                C2D_DrawText(&t, C2D_WithColor | C2D_AlignCenter, cx, ROWY(3 + i), 0, 0.45f, 0.45f, white);
+                C2D_DrawText(&t, C2D_WithColor | C2D_AlignCenter, cx, ROWY(4 + i), 0, 0.45f, 0.45f, white);
             }
-            C2D_DrawText(&tBack, C2D_WithColor | C2D_AlignCenter, cx, ROWY(8), 0, 0.45f, 0.45f, white);
+            C2D_DrawText(&tBack, C2D_WithColor | C2D_AlignCenter, cx, ROWY(9), 0, 0.45f, 0.45f, white);
             #undef ROWY
         }
         C3D_FrameEnd(0);
@@ -361,6 +370,7 @@ int main(void) {
     AppConfig cfg;
     appconfig_load(&cfg);
     if (!net_init()) { gfxExit(); return 1; }
+    audio_init();   // si falla (sin dspfirm.cdc), audio_feed simplemente no hace nada
 
     Ui ui;
     ui_init(&ui);
@@ -373,7 +383,10 @@ int main(void) {
         while (aptMainLoop()) {
             draw_connecting(&ui, cfg.serverIp);
             if (net_handshake(cfg.serverIp, &sh)) { connected = true; break; }
-            if (++fails >= 2) {
+            // El servidor tarda hasta ~8s en volver a aceptar tras perder un
+            // cliente (timeout de inactividad): reintentar un buen rato antes
+            // de asumir que la IP esta mal y abrir el teclado.
+            if (++fails >= 12) {
                 char ipbuf[64];
                 if (swkbd_get(ipbuf, sizeof(ipbuf), "No conecta. IP del servidor:", cfg.serverIp)) {
                     strncpy(cfg.serverIp, ipbuf, sizeof(cfg.serverIp) - 1);
@@ -386,7 +399,8 @@ int main(void) {
             }
         }
         if (!connected) break;
-        if (sh.codec != CODEC_RAW_YUV420 && sh.codec != CODEC_JPEG_YCBCR) break;
+        if (sh.codec != CODEC_RAW_YUV420 && sh.codec != CODEC_JPEG_YCBCR &&
+            sh.codec != CODEC_ETC1) break;
 
         if (net_open_streams(cfg.serverIp, &sh)) {
             int r = stream_loop(&ui, &cfg, &sh);
@@ -397,6 +411,7 @@ int main(void) {
     }
 
     ui_exit(&ui);
+    audio_exit();
     net_exit();
     gfxExit();
     return 0;

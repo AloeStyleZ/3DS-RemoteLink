@@ -343,12 +343,14 @@ int main(int argc, char** argv) {
     AudioSender audio;
     bool     audioStarted = false;
     YuvFrame cur;
+    RgbFrame curRgb;
 
     // Bucle de conexiones: tras un cliente, vuelve a aceptar (soporta reconexion).
     while (g_running) {
         sockaddr_in clientAddr{};
         ServerHello sh{};
-        if (!doHandshake(outputIndex, wantJpeg, fps, quality, clientAddr, sh)) {
+        uint32_t clientMaxKbps = 0;
+        if (!doHandshake(outputIndex, wantJpeg, wantEtc1, fps, quality, clientAddr, sh, clientMaxKbps)) {
             if (!g_running) break;
             continue;                    // reintenta aceptar
         }
@@ -358,7 +360,18 @@ int main(int argc, char** argv) {
         cfg.tileW  = sh.tile_w; cfg.tileH  = sh.tile_h;
         cfg.codec  = sh.codec;  cfg.keyframeInterval = sh.keyframe_interval;
         cfg.jpegQuality = sh.jpeg_quality;
-        cur.alloc(cfg.width, cfg.height);
+        cfg.fps = sh.fps;
+        // Prioridad: --maxkbps > lo que anuncia el cliente > default de VideoConfig.
+        if (maxKbps > 0)            cfg.maxKbps = maxKbps;
+        else if (clientMaxKbps > 0) cfg.maxKbps = (int)clientMaxKbps;
+
+        const bool etc1Mode = (cfg.codec == CODEC_ETC1);
+        if (etc1Mode) {
+            curRgb.alloc(cfg.width, cfg.height);
+            fprintf(stderr, "[main] presupuesto de envio: %d kbps\n", cfg.maxKbps);
+        } else {
+            cur.alloc(cfg.width, cfg.height);
+        }
 
         VideoSender sender;
         if (!sender.init(videoSock, clientAddr, cfg)) continue;
@@ -373,6 +386,7 @@ int main(int argc, char** argv) {
         input.markActive();              // el cliente acaba de conectar
         auto frameDur = std::chrono::milliseconds(1000 / sh.fps);
         int  curQuality = sh.jpeg_quality, curFps = sh.fps;
+        bool everCaptured = false;       // no enviar hasta tener el primer frame real
         uint64_t frames = 0;
         auto statT = std::chrono::steady_clock::now();
         fprintf(stderr, "[main] streaming a %d fps.\n", sh.fps);
@@ -389,31 +403,55 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "[main] calidad -> %d\n", rq); }
             int rf = input.fpsReq();
             if (rf && rf != curFps) { curFps = rf; frameDur = std::chrono::milliseconds(1000 / rf);
-                sender.setKeyframeInterval(rf); fprintf(stderr, "[main] fps -> %d\n", rf); }
+                sender.setKeyframeInterval(rf); sender.setFps(rf);
+                fprintf(stderr, "[main] fps -> %d\n", rf); }
 
             CapturedFrame f;
             if (capture.capture(f, (uint32_t)frameDur.count())) {
                 if (f.valid) {
-                    bgraToI420Scaled(f.bgra, f.width, f.height, f.rowPitch, cur);
-                    capture.endFrame();
+                    // Posicion del cursor escalada al stream (solo modo escritorio;
+                    // DXGI no captura el puntero, lo componemos nosotros).
+                    int sx = -1, sy = -1;
                     if (input.isDesktop()) {
                         POINT pt;
                         if (GetCursorPos(&pt)) {
                             int dw = capture.desktopWidth(), dh = capture.desktopHeight();
                             if (dw > 0 && dh > 0) {
-                                int sx = (int)((long long)pt.x * cfg.width  / dw);
-                                int sy = (int)((long long)pt.y * cfg.height / dh);
+                                sx = (int)((long long)pt.x * cfg.width  / dw);
+                                sy = (int)((long long)pt.y * cfg.height / dh);
                                 if (sx < 0) sx = 0; else if (sx >= cfg.width)  sx = cfg.width  - 1;
                                 if (sy < 0) sy = 0; else if (sy >= cfg.height) sy = cfg.height - 1;
-                                drawCursorMarker(cur, sx, sy);
                             }
                         }
                     }
-                    sender.sendFrame(cur, input.takeKeyframeReq());
+                    if (etc1Mode) {
+                        if (testRamp >= 0)     fillChannelRamp(curRgb, testRamp, rampOneTile ? cfg.tileW : -1);
+                        else if (testRainbow)  fillRainbowPattern(curRgb);
+                        else if (testPattern)  fillTestPattern(curRgb, sender.tilesX(), sender.tilesY(), cfg.tileW, cfg.tileH, testGradient);
+                        else                   bgraToRgbScaled(f.bgra, f.width, f.height, f.rowPitch, curRgb);
+                        capture.endFrame();
+                        if (sx >= 0) drawCursorMarkerRgb(curRgb, sx, sy);
+                    } else {
+                        bgraToI420Scaled(f.bgra, f.width, f.height, f.rowPitch, cur);
+                        capture.endFrame();
+                        if (sx >= 0) drawCursorMarker(cur, sx, sy);
+                    }
+                    everCaptured = true;
                     ++frames;
                 }
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            // Enviar SIEMPRE (haya o no frame nuevo de captura). Con pantalla
+            // estatica DXGI no entrega frames; si no enviaramos nada: (a) el
+            // cliente cae por su timeout de recepcion (4s) y "se desconecta",
+            // (b) los tiles perdidos por UDP no se repararian nunca (el
+            // refresco rotativo corre dentro de sendFrame*). Sin cambios reales
+            // esto solo emite el refresco (~38 KB/s), no contenido repetido.
+            if (everCaptured) {
+                if (etc1Mode) sender.sendFrameEtc1(curRgb, input.takeKeyframeReq());
+                else          sender.sendFrame(cur, input.takeKeyframeReq());
             }
 
             auto elapsed = std::chrono::steady_clock::now() - t0;
@@ -421,8 +459,18 @@ int main(int argc, char** argv) {
 
             auto now = std::chrono::steady_clock::now();
             if (now - statT >= std::chrono::seconds(2)) {
-                fprintf(stderr, "[main] %.1f fps enviados\n",
-                        frames / std::chrono::duration<double>(now - statT).count());
+                const double secs = std::chrono::duration<double>(now - statT).count();
+                if (etc1Mode) {
+                    VideoStats vs = sender.statsFetch();
+                    fprintf(stderr, "[main] %.1f fps | %.1f tiles/f | %.0f KB/s | enc %.1f ms/f | backlog %d\n",
+                            frames / secs,
+                            frames ? (double)vs.tiles / frames : 0.0,
+                            vs.bytes / 1024.0 / secs,
+                            frames ? vs.encodeMs / frames : 0.0,
+                            vs.backlog);
+                } else {
+                    fprintf(stderr, "[main] %.1f fps enviados\n", frames / secs);
+                }
                 frames = 0; statT = now;
             }
         }

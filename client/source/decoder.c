@@ -162,6 +162,62 @@ static void decode_tile_jpeg(VideoDecoder* d, int tx, int ty,
                             d->tileW, strides, d->tileH, TJFLAG_FASTDCT);
 }
 
+// Offset (en bytes) del bloque ETC1 en (bx,by) dentro de la textura POT, segun
+// el tiling del PICA200: super-tiles de 8x8 pixeles (2x2 bloques) en orden
+// row-major, y dentro de cada super-tile los 4 bloques en orden TL,TR,BL,BR
+// (que para una rejilla 2x2 coincide con Z-order). Verificado contra el loop
+// de encode.cpp de tex3ds y CONFIRMADO en hardware real (la version lineal
+// simple duplicaba la imagen en dos "islas").
+static inline u32 etc1BlockOffset(int bx, int by, int potBlocksPerRow) {
+    const int superX = bx >> 1, superY = by >> 1;
+    const int wx = bx & 1, wy = by & 1;
+    const int superPerRow = potBlocksPerRow >> 1;
+    const int superIndex = superY * superPerRow + superX;
+    const int localBlock = wy * 2 + wx; // 0=TL 1=TR 2=BL 3=BR
+    return (u32)(superIndex * 4 + localBlock) * ETC1_BLOCK_BYTES;
+}
+
+// Coloca los bloques ETC1 de un tile (recibidos en `blob`, en orden de lectura
+// fila-a-fila) en la textura, en el offset swizzled que espera la GPU. Sin
+// decode real: cada bloque de 8 bytes se copia tal cual, la GPU lo descomprime
+// sola al muestrear -> coste de CPU minimo (solo el propio swizzle/memcpy).
+static void decode_tile_etc1(VideoDecoder* d, int tx, int ty, const u8* blob) {
+    const int bpr = d->blocksPerTileRow, bpc = d->blocksPerTileCol;
+    const int baseBx = tx * bpr, baseBy = ty * bpc;
+    for (int ly = 0; ly < bpc; ++ly) {
+        for (int lx = 0; lx < bpr; ++lx) {
+            const u32 off = etc1BlockOffset(baseBx + lx, baseBy + ly, d->potBlocksPerRow);
+            memcpy((u8*)d->tex.data + off, blob + (size_t)(ly * bpr + lx) * ETC1_BLOCK_BYTES,
+                   ETC1_BLOCK_BYTES);
+        }
+    }
+}
+
+// Tile PARCIAL (VFLAG_TILE_DELTA): payload = [bitmap de bloques incluidos] +
+// [solo esos bloques, en orden de indice]. Parchea sobre la textura existente:
+// los bloques no incluidos conservan lo ultimo recibido. Aun mas barato que el
+// tile completo (menos bytes de red Y menos memcpy).
+static void decode_tile_etc1_delta(VideoDecoder* d, int tx, int ty,
+                                   const u8* blob, int blobLen) {
+    const int bpr = d->blocksPerTileRow, bpc = d->blocksPerTileCol;
+    const int nBlocks  = bpr * bpc;
+    const int mapBytes = (nBlocks + 7) / 8;
+    if (blobLen < mapBytes) return;   // payload corrupto/incompleto
+
+    const u8* map = blob;
+    const u8* src = blob + mapBytes;
+    const u8* end = blob + blobLen;
+    const int baseBx = tx * bpr, baseBy = ty * bpc;
+    for (int i = 0; i < nBlocks; ++i) {
+        if (!(map[i >> 3] & (1u << (i & 7)))) continue;
+        if (src + ETC1_BLOCK_BYTES > end) break;   // bitmap no cuadra con los datos
+        const int lx = i % bpr, ly = i / bpr;
+        const u32 off = etc1BlockOffset(baseBx + lx, baseBy + ly, d->potBlocksPerRow);
+        memcpy((u8*)d->tex.data + off, src, ETC1_BLOCK_BYTES);
+        src += ETC1_BLOCK_BYTES;
+    }
+}
+
 // Convierte los planos I420 -> textura RGB565 mediante el HW Y2R (o, en modo
 // ETC1, simplemente publica los bloques ya escritos: no hay conversion que
 // hacer, la GPU descomprime ETC1 sola al muestrear la textura).
@@ -171,6 +227,7 @@ static void video_present(VideoDecoder* d) {
         // hay que volcarla a RAM para que la GPU vea los bytes al texturizar.
         GSPGPU_FlushDataCache(d->tex.data, d->tex.size);
         d->ready = true;
+        d->framesPresented++;
         return;
     }
 
@@ -211,7 +268,8 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
     memcpy(&h, pkt, sizeof(h)); // copia para evitar accesos desalineados
     if (h.magic != PROTO_MAGIC || h.type != PKT_VIDEO) return false;
     if (h.tile_id >= d->tileCount)        return false;
-    if (h.codec != CODEC_RAW_YUV420 && h.codec != CODEC_JPEG_YCBCR && h.codec != CODEC_RLE_YUV420) return false;
+    if (h.codec != CODEC_RAW_YUV420 && h.codec != CODEC_JPEG_YCBCR &&
+        h.codec != CODEC_RLE_YUV420 && h.codec != CODEC_ETC1) return false;
     if (h.frag_index >= MAX_FRAGS_PER_TILE) return false;
 
     const u8* payload = pkt + sizeof(VideoPktHeader);
@@ -247,6 +305,10 @@ bool video_on_packet(VideoDecoder* d, const u8* pkt, int len) {
                     decode_tile_jpeg(d, tx, ty, r->buf, r->tileBytes);
                 else if (h.codec == CODEC_RLE_YUV420)
                     decode_tile_rle(d, tx, ty, r->buf, r->tileBytes);
+                else if (h.codec == CODEC_ETC1 && (h.flags & VFLAG_TILE_DELTA))
+                    decode_tile_etc1_delta(d, tx, ty, r->buf, (int)r->tileBytes);
+                else if (h.codec == CODEC_ETC1)
+                    decode_tile_etc1(d, tx, ty, r->buf);
                 else
                     unpack_tile_raw(d, tx, ty, r->buf);
                 // Hay datos nuevos -> presentar. NO esperamos al FRAME_END (que

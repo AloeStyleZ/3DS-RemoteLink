@@ -76,8 +76,21 @@ enum {
 enum {
     CODEC_RAW_YUV420 = 0,  /* planos Y||U||V crudos del tile (CPU ~0 en 3DS)   */
     CODEC_JPEG_YCBCR = 1,  /* JPEG del tile, salida en planos YCbCr (sin RGB)  */
-    CODEC_RLE_YUV420 = 2   /* RLE por plano (tiles "planos": UI/menus/texto)   */
+    CODEC_RLE_YUV420 = 2,  /* RLE por plano (tiles "planos": UI/menus/texto)   */
+    CODEC_ETC1       = 3   /* bloques ETC1: la GPU del 3DS descomprime sola al
+                              muestrear la textura (CPU ~0 en el cliente)      */
 };
+
+/* Bits de capacidad (ClientHello.codec_caps): que codecs decodifica el cliente. */
+enum {
+    CODEC_CAP_RAW  = 1u << 0,
+    CODEC_CAP_JPEG = 1u << 1,
+    CODEC_CAP_RLE  = 1u << 2,
+    CODEC_CAP_ETC1 = 1u << 3
+};
+
+/* Un bloque ETC1 comprime 4x4 pixeles en 8 bytes (compartido cliente/servidor). */
+#define ETC1_BLOCK_BYTES 8
 
 /* =============================================================================
  *  CANAL DE VIDEO   (PC -> 3DS, UDP, puerto 8000)
@@ -98,7 +111,11 @@ enum {
     VFLAG_FRAME_START = 1u << 0,  /* primer datagrama de un frame_id nuevo      */
     VFLAG_FRAME_END   = 1u << 1,  /* completa el frame -> el cliente presenta   */
     VFLAG_KEYFRAME    = 1u << 2,  /* este frame contiene TODOS los tiles        */
-    VFLAG_TILE_LAST   = 1u << 3   /* ultimo fragmento de este tile (= frag_index==frag_count-1) */
+    VFLAG_TILE_LAST   = 1u << 3,  /* ultimo fragmento de este tile (= frag_index==frag_count-1) */
+    VFLAG_TILE_DELTA  = 1u << 4   /* (solo ETC1) tile PARCIAL: el payload es
+                                     [bitmap de bloques cambiados] + [solo esos
+                                     bloques de 8 bytes, en orden de indice].
+                                     El cliente parchea sobre lo que ya tiene.  */
 };
 
 typedef struct {

@@ -4,7 +4,7 @@
 #include <string.h>
 
 #define CFG_PATH  "sdmc:/3ds/3dsstream.cfg"
-#define CFG_MAGIC 0x44535332u   // "DSS2"
+#define CFG_MAGIC 0x44535333u   // "DSS3" (v3: +audioOn)
 
 typedef struct { u32 magic; AppConfig c; } CfgFile;
 
@@ -13,7 +13,7 @@ void appconfig_load(AppConfig* c) {
     memset(c, 0, sizeof(*c));
     strncpy(c->serverIp, SERVER_IP, sizeof(c->serverIp) - 1);
     c->quality = 40; c->fps = 24; c->inputMode = 0; c->buttonSwap = 0;
-    c->sensPercent = 100; c->deadzone = 8; c->fpsHud = 0;
+    c->sensPercent = 100; c->deadzone = 8; c->fpsHud = 0; c->audioOn = 0;
 
     FILE* f = fopen(CFG_PATH, "rb");
     if (!f) return;

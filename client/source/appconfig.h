@@ -11,6 +11,7 @@ typedef struct {
     int  sensPercent; // 50..200 (sensibilidad del circle pad)
     int  deadzone;    // 0..40 (zona muerta del circle pad)
     int  fpsHud;      // 0/1 (overlay de FPS)
+    int  audioOn;     // 0/1 (pedir audio al servidor y reproducirlo con NDSP)
 } AppConfig;
 
 void appconfig_load(AppConfig* c);   // rellena con defaults si no hay fichero

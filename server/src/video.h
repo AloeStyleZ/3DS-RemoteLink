@@ -45,9 +45,15 @@ public:
     // envia. forceKey fuerza un keyframe (todos los tiles).
     void sendFrame(const YuvFrame& cur, bool forceKey = false);
 
+    // Igual que arriba, pero para el codec ETC1 (fuente RGB888, sin YUV), con
+    // control de flujo: presupuesto de bytes/frame (maxKbps/fps) + refresco
+    // rotativo en vez de keyframes en rafaga. forceKey re-marca todos los tiles.
+    void sendFrameEtc1(const RgbFrame& cur, bool forceKey = false);
+
     // Ajustes en vivo (desde mensajes de control del cliente).
     void setQuality(int q)          { if (q < 10) q = 10; if (q > 95) q = 95; cfg_.jpegQuality = q; }
     void setKeyframeInterval(int n) { if (n < 1) n = 1;  cfg_.keyframeInterval = (uint8_t)n; }
+    void setFps(int f);   // recalcula el presupuesto de bytes/frame (ETC1)
 
     int tilesX() const { return tilesX_; }
     int tilesY() const { return tilesY_; }
@@ -96,8 +102,16 @@ private:
     // pendiente cuando cambia (o le toca refresco rotativo) y por frame se envia
     // como maximo el presupuesto de bytes derivado de maxKbps/fps. Lo que no
     // cabe queda pendiente para el frame siguiente (round-robin, sin inanicion).
-    std::vector<uint8_t> pendingEtc1_;  // 1 = tile con envio pendiente
+    // pendingEtc1_: 0 = nada, 1 = puede ir como DELTA (solo bloques cambiados),
+    // 2 = debe ir COMPLETO (primera vez / refresco rotativo / keyframe — los
+    // completos son el mecanismo de reparacion ante perdida UDP: un delta asume
+    // que el cliente tiene la base correcta, un completo restablece todo).
+    std::vector<uint8_t> pendingEtc1_;
+    std::vector<uint8_t> lastEtc1_;      // ultima codificacion ENVIADA por tile
+    std::vector<uint8_t> tileEverSent_;  // 0/1: ya se envio completo alguna vez
+    std::vector<uint8_t> sendScratch_;   // payloads del frame en curso (jobs)
     int                  rotRefresh_ = 0;  // proximo tile del refresco rotativo
+    int                  rotAccum_   = 0;  // acumulador fraccional del refresco
     int                  sendCursor_ = 0;  // arranque round-robin del envio
     size_t               frameBudget_ = 0; // bytes de payload por frame
 
